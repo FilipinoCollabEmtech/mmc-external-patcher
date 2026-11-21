@@ -306,7 +306,19 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 MemoryPatcher.uninstallLos(pid!!, base!!)
                 true
             } else {
-                MemoryPatcher.installLos(pid!!, base!!)
+                if (states["aim"] != true) {
+                    if (!toggleAimlock(true)) {
+                        toast("Could not enable Aimlock")
+                        return@toggleRow false
+                    }
+                    states["aim"] = true
+                }
+                val installed = MemoryPatcher.installLos(pid!!, base!!)
+                if (installed) {
+                    toast("Aimlock + Wall Check ON")
+                    Handler(Looper.getMainLooper()).post { refreshPanel() }
+                }
+                installed
             }
         })
         container.addView(toggleRow("espBoxes", "▣", "ESP Boxes", "Outline targets through walls") { checked ->
@@ -567,6 +579,13 @@ internal class FloatingMenu(private val activity: MainActivity) {
         }
         PatchLogger.log("ESP", "flags boxes=$espBoxes lines=$espLines")
         MemoryPatcher.setEspFlags(p, b, espBoxes, espLines)
+    }
+
+    private fun refreshPanel() {
+        if (!expanded) return
+        panel?.let { runCatching { wm.removeView(it) } }
+        panel = buildPanel()
+        wm.addView(panel, panelParams)
     }
 
     private fun toast(message: String) {
