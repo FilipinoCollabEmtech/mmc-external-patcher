@@ -298,6 +298,48 @@ internal object MemoryPatcher {
         return x to y
     }
 
+    /** Multi-line dump of every pointer in the ESP/aim chain, for the debug overlay. */
+    fun debugInfo(pid: Int, base: Long): String {
+        fun hex(v: Long?) = v?.let { "0x${it.toString(16)}" } ?: "null"
+        val sb = StringBuilder()
+        sb.appendLine("pid=$pid base=0x${base.toString(16)}")
+
+        val director = readLong(pid, base + DIRECTOR_GLOBAL)
+        val scene = director?.let { readLong(pid, it + 0xa0) }
+        sb.appendLine("director=${hex(director)} scene=${hex(scene)}")
+        if (director != null) {
+            val w = readFloat(pid, director + 0xd0)
+            val h = readFloat(pid, director + 0xd4)
+            sb.appendLine("winSize=${w?.toInt()}x${h?.toInt()}")
+        }
+
+        val lHolder = readLong(pid, LOCAL_CONTROLLER_GLOBAL)
+        val lc = lHolder?.let { readLong(pid, it) }
+        sb.appendLine("localHolder=${hex(lHolder)} localCtrl=${hex(lc)}")
+        val lp = localPosition(pid)
+        sb.appendLine("localPos=${lp?.first?.toInt()},${lp?.second?.toInt()}")
+
+        fun dumpDict(label: String, global: Long, isDrone: Boolean) {
+            val holder = readLong(pid, global)
+            val dict = holder?.let { readLong(pid, it) }
+            sb.appendLine("$label holder=${hex(holder)} dict=${hex(dict)}")
+            if (dict == null || dict == 0L) return
+            val objs = dictionaryObjects(pid, global)
+            sb.appendLine("$label objects=${objs.size}")
+            for (o in objs.take(3)) {
+                val p = if (isDrone) dronePosition(pid, base, o) else soldierPosition(pid, o)
+                sb.appendLine("  ${hex(o)} -> ${p?.first?.toInt()},${p?.second?.toInt()}")
+            }
+        }
+        dumpDict("remote", REMOTE_PLAYERS_GLOBAL, false)
+        dumpDict("drones", ALL_DRONES_GLOBAL, true)
+
+        val cam = camera(pid, base)
+        val targets = collectTargets(pid, base)
+        sb.appendLine("cam=${cam?.x?.toInt()},${cam?.y?.toInt()} targets=${targets.size}")
+        return sb.toString()
+    }
+
     // ---- aimlock ----
 
     /** View sway must be zeroed or bullets fly off-angle even when the reticle is right. */

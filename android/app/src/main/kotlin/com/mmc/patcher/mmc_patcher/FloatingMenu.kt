@@ -27,6 +27,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var pid: Int? = null
     private var base: Long? = null
     private var esp: EspOverlay? = null
+    private var debug: DebugOverlay? = null
 
     private val accent = Color.rgb(255, 82, 82)
     private val panelBg = Color.rgb(16, 16, 20)
@@ -67,6 +68,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
         expanded = false
         esp?.hide()
         esp = null
+        debug?.hide()
+        debug = null
     }
 
     private fun rounded(color: Int, radius: Float): GradientDrawable = GradientDrawable().apply {
@@ -190,6 +193,26 @@ internal class FloatingMenu(private val activity: MainActivity) {
             }
             container.addView(sw)
         }
+
+        container.addView(sectionLabel("DIAGNOSTICS"))
+        val debugSwitch = Switch(activity).apply {
+            text = "Live debug data"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(6, 4, 0, 10)
+            isChecked = false
+        }
+        debugSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked) {
+                if (debug == null) debug = DebugOverlay(activity)
+                debug?.show()
+            } else {
+                debug?.hide()
+                debug = null
+            }
+            toast("Debug: ${if (checked) "ON" else "OFF"}")
+        }
+        container.addView(debugSwitch)
 
         val minimize = TextView(activity).apply {
             text = "—  MINIMIZE  —"
