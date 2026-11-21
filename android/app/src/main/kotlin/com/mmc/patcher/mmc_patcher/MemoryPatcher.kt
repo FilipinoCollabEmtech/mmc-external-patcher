@@ -174,8 +174,8 @@ internal object MemoryPatcher {
 
     // ---- dictionary walking (both globals need TWO pointer reads) ----
 
-    private fun dictionaryObjects(pid: Int, holderGlobal: Long): List<Long> {
-        val holder = readLong(pid, holderGlobal) ?: return emptyList()
+    private fun dictionaryObjects(pid: Int, base: Long, holderGlobal: Long): List<Long> {
+        val holder = readLong(pid, base + holderGlobal) ?: return emptyList()
         if (holder == 0L) return emptyList()
         val dict = readLong(pid, holder) ?: return emptyList()
         if (dict == 0L) return emptyList()
@@ -217,11 +217,11 @@ internal object MemoryPatcher {
         return null
     }
 
-    fun localController(pid: Int): Long? =
-        readLong(pid, LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
+    fun localController(pid: Int, base: Long): Long? =
+        readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
 
-    fun localPosition(pid: Int): Pair<Double, Double>? {
-        val lc = localController(pid) ?: return null
+    fun localPosition(pid: Int, base: Long): Pair<Double, Double>? {
+        val lc = localController(pid, base) ?: return null
         return soldierPosition(pid, lc)
     }
 
@@ -230,7 +230,7 @@ internal object MemoryPatcher {
         val seen = HashSet<Long>()
 
         // Campaign robots: all-drones dictionary at *(*(base+0x13be0a0))
-        for (obj in dictionaryObjects(pid, ALL_DRONES_GLOBAL)) {
+        for (obj in dictionaryObjects(pid, base, ALL_DRONES_GLOBAL)) {
             if (!seen.add(obj)) continue
             val pos = dronePosition(pid, base, obj) ?: continue
             val kind = when (readLong(pid, obj)?.minus(base)) {
@@ -242,7 +242,7 @@ internal object MemoryPatcher {
         }
 
         // Multiplayer / LAN players: *(*(base+0x13bf260))
-        for (ctrl in dictionaryObjects(pid, REMOTE_PLAYERS_GLOBAL)) {
+        for (ctrl in dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)) {
             if (!seen.add(ctrl)) continue
             val pos = soldierPosition(pid, ctrl) ?: continue
             out.add(EspTarget(pos.first, pos.second, KIND_PLAYER, 0f))
@@ -313,18 +313,18 @@ internal object MemoryPatcher {
             sb.appendLine("winSize=${w?.toInt()}x${h?.toInt()}")
         }
 
-        val lHolder = readLong(pid, LOCAL_CONTROLLER_GLOBAL)
+        val lHolder = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)
         val lc = lHolder?.let { readLong(pid, it) }
         sb.appendLine("localHolder=${hex(lHolder)} localCtrl=${hex(lc)}")
-        val lp = localPosition(pid)
+        val lp = localPosition(pid, base)
         sb.appendLine("localPos=${lp?.first?.toInt()},${lp?.second?.toInt()}")
 
         fun dumpDict(label: String, global: Long, isDrone: Boolean) {
-            val holder = readLong(pid, global)
+            val holder = readLong(pid, base + global)
             val dict = holder?.let { readLong(pid, it) }
             sb.appendLine("$label holder=${hex(holder)} dict=${hex(dict)}")
             if (dict == null || dict == 0L) return
-            val objs = dictionaryObjects(pid, global)
+            val objs = dictionaryObjects(pid, base, global)
             sb.appendLine("$label objects=${objs.size}")
             for (o in objs.take(3)) {
                 val p = if (isDrone) dronePosition(pid, base, o) else soldierPosition(pid, o)
@@ -358,7 +358,7 @@ internal object MemoryPatcher {
     }
 
     private fun aimAngle(pid: Int, base: Long): Float? {
-        val lc = localController(pid) ?: return null
+        val lc = localController(pid, base) ?: return null
         zeroSway(pid, lc)
         val origin = soldierPosition(pid, lc) ?: return baseAngle(pid, lc)
         var best = 4000.0

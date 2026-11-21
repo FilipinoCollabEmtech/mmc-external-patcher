@@ -92,22 +92,46 @@ internal class FloatingMenu(private val activity: MainActivity) {
     }
 
     @SuppressLint("SetTextI18n")
-    private fun buildPanel(): LinearLayout {
-        val container = LinearLayout(activity).apply {
+    private fun buildPanel(): View {
+        val density = activity.resources.displayMetrics.density
+        val root = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded(panelBg, 18f)
-            setPadding(30, 22, 30, 22)
         }
 
+        val header = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding((18 * density).toInt(), (12 * density).toInt(), (12 * density).toInt(), (12 * density).toInt())
+        }
         val title = TextView(activity).apply {
-            text = "MMC  PATCHER"
+            text = "MMC PATCHER"
             setTextColor(accent)
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
             letterSpacing = 0.08f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        container.addView(title)
+        header.addView(title)
+        val close = TextView(activity).apply {
+            text = "✕"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setTextColor(Color.rgb(255, 120, 120))
+            setPadding((10 * density).toInt(), 0, (10 * density).toInt(), 0)
+            setOnClickListener { togglePanel() }
+        }
+        header.addView(close)
+        makeDraggable(header, { panelParams }, { panelParams = it })
+        root.addView(header)
+
+        val scroll = android.widget.ScrollView(activity).apply {
+            setPadding((18 * density).toInt(), 0, (18 * density).toInt(), (14 * density).toInt())
+            isVerticalScrollBarEnabled = true
+        }
+        val container = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(container)
+        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         if (pid == null || base == null) {
             val attached = MemoryPatcher.attach()
@@ -214,18 +238,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         }
         container.addView(debugSwitch)
 
-        val minimize = TextView(activity).apply {
-            text = "—  MINIMIZE  —"
-            setTextColor(Color.rgb(140, 190, 255))
-            textSize = 12f
-            gravity = Gravity.CENTER
-            setPadding(0, 12, 0, 0)
-            setOnClickListener { togglePanel() }
-        }
-        container.addView(minimize)
-
-        makeDraggable(container, { panelParams }, { panelParams = it })
-        return container
+        return root
     }
 
     private fun sectionLabel(text: String): TextView = TextView(activity).apply {
@@ -246,6 +259,9 @@ internal class FloatingMenu(private val activity: MainActivity) {
             panel = buildPanel()
             panelParams.x = iconParams.x
             panelParams.y = iconParams.y
+            val dm = activity.resources.displayMetrics
+            panelParams.width = (270 * dm.density).toInt()
+            panelParams.height = (dm.heightPixels - 140).coerceAtMost((620 * dm.density).toInt())
             wm.addView(panel, panelParams)
             expanded = true
         } else {

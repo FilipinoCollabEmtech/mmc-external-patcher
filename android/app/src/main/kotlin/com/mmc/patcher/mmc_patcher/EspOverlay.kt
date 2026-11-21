@@ -50,7 +50,7 @@ internal class EspOverlay(private val activity: MainActivity) {
                 if (p != null && b != null) {
                     targets = collectTargets(p, b)
                     cam = camera(p, b)
-                    origin = localPosition(p)?.let { pos ->
+                    origin = localPosition(p, b)?.let { pos ->
                         cam?.let { c -> project(pos.first, pos.second, c) }
                     }
                 }
