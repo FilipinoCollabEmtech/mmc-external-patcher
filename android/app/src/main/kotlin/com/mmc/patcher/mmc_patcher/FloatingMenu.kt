@@ -497,6 +497,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 on = next
                 states[key] = next
                 paint()
+                PatchLogger.log("TOGGLE", "$label -> ${if (next) "ON" else "OFF"}")
                 toast("$label: ${if (next) "ON" else "OFF"}")
             } else {
                 toast("Could not toggle $label")

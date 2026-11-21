@@ -58,8 +58,20 @@ internal object PatchLogger {
         sb.appendLine("--- app events ---")
         synchronized(events) { events.forEach { sb.appendLine(it) } }
         sb.appendLine()
-        sb.appendLine("--- logcat tail ---")
-        sb.appendLine(readLogcat())
+        val logcat = readLogcat().lines()
+        val crashPattern = Regex(
+            """FATAL EXCEPTION|signal \d+|SIGSEGV|SIGABRT|SIGBUS|crash_dump|DEBUG|tombstone|ANR|Killed process|lowmemorykiller|MMCPatcher|cocos2d|libc|F DEBUG""",
+            RegexOption.IGNORE_CASE,
+        )
+        val highlights = logcat.filter { crashPattern.containsMatchIn(it) }.takeLast(80)
+        sb.appendLine("--- crash highlights ---")
+        if (highlights.isEmpty()) sb.appendLine("(none found)") else highlights.forEach { sb.appendLine(it) }
+        sb.appendLine()
+        sb.appendLine("--- dmesg tail ---")
+        sb.appendLine(readDmesg())
+        sb.appendLine()
+        sb.appendLine("--- logcat tail (last 120 lines) ---")
+        logcat.takeLast(120).forEach { sb.appendLine(it) }
         val text = sb.toString()
         runCatching { File(context.filesDir, "mmc_patcher_log.txt").writeText(text) }
         return text
@@ -76,8 +88,9 @@ internal object PatchLogger {
 
     private fun readLogcat(): String {
         val commands = listOf(
-            arrayOf("su", "-c", "logcat -d -t 250"),
-            arrayOf("logcat", "-d", "-t", "250"),
+            arrayOf("su", "-c", "logcat -b all -d -t 400"),
+            arrayOf("logcat", "-b", "main,system,crash", "-d", "-t", "400"),
+            arrayOf("logcat", "-d", "-t", "400"),
         )
         for (command in commands) {
             try {
@@ -89,5 +102,13 @@ internal object PatchLogger {
             }
         }
         return "(logcat unavailable)"
+    }
+
+    private fun readDmesg(): String = try {
+        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "dmesg | tail -80"))
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        if (output.isNotBlank()) output else "(dmesg empty)"
+    } catch (_: Exception) {
+        "(dmesg unavailable)"
     }
 }
