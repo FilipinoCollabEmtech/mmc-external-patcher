@@ -47,6 +47,39 @@ internal object MemoryPatcher {
     private const val ALL_DRONES_GLOBAL = 0x13be0a0L
     private const val DIRECTOR_GLOBAL = 0x13ec228L
 
+    // Internal ESP: one hook in Stage::draw, engine in the .plt/.text alignment gap.
+    private const val STAGE_DRAW_OFFSET = 0x9087d8L
+    private const val ESP_CODE_OFFSET = 0x500310L
+    private const val ESP_DATA_OFFSET = 0x500b10L
+    private const val MPROTECT_OFFSET = 0x4d51d0L
+
+    private const val ESP_ENGINE_HEX =
+        "ff4303d1fd7b0ba9f35300a9f55b01a9f76302a9f96b03a9fb7304a9e827803de06300f9f33e0010600640b920010035e00313aa00cc7492010084d2e20080d2" +
+        "701e40f900023fd620008052600600b97c0240b93c0a0034e06340f9612a40f91f0001eb80000054602a00f97f2200f97f2600f9622640f9820000b5e06340f9" +
+        "57000094602600f9752640f9550000b5f56340f9742240f9940100b5700a40f900023fd6600800b4f40300aa742200f9e00315aae10314aa02d490d22200a0f2" +
+        "700e40f900023fd6e00314aa701240f900023fd67e000094e05300bde15700bd602e40f9000040f9170c40f9180080d2770200b41f0304f12a02005418070091" +
+        "f68640f9f79240f956ffffb4e00316aa90000094e05b00bde15f00bdd80000949cfe0f36e05b40bde15f40bde25340bde35740bd12010094eeffff17603240f9" +
+        "000040f9170c40f9180080d2370300b41f0304f1ea02005418070091f68640f9f79240f956ffffb4e00316aa67000094e05b00bde15f00bdc10000949cfe0f36" +
+        "e05b40bde15f40bde25340bde35740bdfb000094eeffff17602240f9a00000b4701240f900023fd67f2200f901000014e06340f9f35340a9f55b41a9f76342a9" +
+        "f96b43a9fb7344a9e827c03dfd7b4ba9ff430391ff8300d1bd201014ff4301d1e02700f9ff1300f9e003271e015c40f9810600b4210c40f9410600b4220040b9" +
+        "5f000071ed0500545f000871ac050054230440f9630500b4040080d29f00026b0a050054657864f8850400b4a65c40f9460400b4c60c40f9060400b4c70040b9" +
+        "ff000071ad030054ff0008716c030054c80440f9280300b4090080d23f01076bca0200540a7969f84a0200b4432d40bd443140bd63c0201e84c0201e6528241e" +
+        "0b59a8526601271e4b3fa8526701271ea020261ee9000054a020271eaa000054a020201e69000054a040201eea1300f929050091eaffff1784040091d8ffff17" +
+        "e01340f9ff430191c0035fd6603640f9000040f9400100b4000040f9000100b401d440f9c10000b4201840fd211c40fd0040621e2140621ec0035fd6e003271e" +
+        "e103271ec0035fd601d440f9e10000b4201840fd211c40fd0040621e2140621e62008052c0035fd6e003271ee103271e62008052c0035fd6006861f8600000b4" +
+        "00d440f9c0035fd6000080d2c0035fd6ffc300d1fe1300f9e01700f9610640f9020040f9420001cb034080d2040080520500805206c488d26626a0f25f0006eb" +
+        "40040054063a9ad24626a0f25f0006ebc0030054060087d26626a0f25f0006eba1000054034680d2240080522500805216000014062e95d2a626a0f25f0006eb" +
+        "a1000054034580d244008052250080520e000014034080d204008052e01740f9d6ffff97800100b5034680d224008052e01740f9d1ffff97e00000b5034580d2" +
+        "4400805201000014e01740f9e10303aacaffff97200100b4001840fd011c40fd0040621e2140621ee203042afe1340f9ffc30091c0035fd6e003271ee103271e" +
+        "02008052fe1340f9ffc30091c0035fd66b3e40f95f040071610000546b4640f9c0035fd65f080071610000546b4e40f9c0035fd66b5640f9c0035fd6ff0302d1" +
+        "fe3f00f9e04300bde14700bdf1ffff976001c03de01b803d0334a8526300271e030090526341a8726400271e0538231e0628231e2738241e2828241ee52300bd" +
+        "e72700bde62b00bde72f00bde63300bde83700bde53b00bde83f00bd0900a8522001271ee00314aae1830091e2a300912001271ee3830191701640f900023fd6" +
+        "e00314aae1a30091e2c300912001271ee3830191701640f900023fd6e00314aae1c30091e2e300912001271ee3830191701640f900023fd6e00314aae1e30091" +
+        "e28300912001271ee3830191701640f900023fd60910a852e00314aae10301912001271ee2830191701a40f900023fd6fe3f40f9ff030291c0035fd6ff4301d1" +
+        "fe2700f9b3ffff976001c03de00f803de02300bde12700bde22b00bde32f00bde00314aae1830091e2a3009109f0a7522001271ee3c30091701640f900023fd6" +
+        "fe2740f9ff430191c0035fd6"
+
+    private val espSaved = HashMap<Long, ByteArray>()
     private val originals = HashMap<Long, ByteArray>()
     private var aimThread: Thread? = null
     @Volatile private var aimRunning = false
@@ -424,6 +457,63 @@ internal object MemoryPatcher {
             val base = findModuleBase(pid) ?: return false
             val original = originals.remove(base + FIRE_ANGLE_OFFSET) ?: return false
             return writeBytes(pid, base + FIRE_ANGLE_OFFSET, original)
+        }
+    }
+
+    // ---- internal ESP (drawn inside Stage::draw, no per-frame syscalls) ----
+
+    /** Installs the in-process draw hook once. Refuses to run against an unknown build/cave. */
+    fun installInternalEsp(pid: Int, base: Long): Boolean {
+        val orig = readBytes(pid, base + STAGE_DRAW_OFFSET, 4) ?: return false
+        if (!orig.contentEquals(hexToBytes("FF8300D1"))) return false
+        if (readBytes(pid, base + ESP_CODE_OFFSET, 4)?.any { it != 0.toByte() } != false) return false
+
+        val d = ByteBuffer.allocate(0xb8).order(ByteOrder.LITTLE_ENDIAN)
+        d.putInt(0)                       // flags: bit0 boxes, bit1 lines
+        d.putInt(0)                       // engine-set init marker
+        d.putLong(base)
+        d.putLong(base + 0xc3f1d8L)       // CCDrawNode::create
+        d.putLong(base + 0xc23a7cL)       // CCNode::addChild
+        d.putLong(base + 0xc41314L)       // CCDrawNode::clear
+        d.putLong(base + 0xc3fb30L)       // drawSegment
+        d.putLong(base + 0xc3f700L)       // drawDot
+        d.putLong(base + MPROTECT_OFFSET)
+        d.putLong(0)                      // cached draw node
+        d.putLong(0)                      // cached world layer
+        d.putLong(0)                      // cached stage
+        d.putLong(base + ALL_DRONES_GLOBAL)
+        d.putLong(base + REMOTE_PLAYERS_GLOBAL)
+        d.putLong(base + LOCAL_CONTROLLER_GLOBAL)
+        d.putLong(base + STAGE_DRAW_OFFSET + 4) // resume after the 4-byte hook
+        arrayOf(
+            floatArrayOf(1f, 0.15f, 0.15f, 1f),
+            floatArrayOf(0.15f, 0.85f, 1f, 1f),
+            floatArrayOf(1f, 0.85f, 0.15f, 1f),
+            floatArrayOf(0.3f, 1f, 0.3f, 1f),
+        ).forEach { color -> color.forEach { d.putFloat(it) } }
+
+        if (!writeBytes(pid, base + ESP_DATA_OFFSET, d.array())) return false
+        if (!writeBytes(pid, base + ESP_CODE_OFFSET, hexToBytes(ESP_ENGINE_HEX))) return false
+        if (!writeBytes(pid, base + STAGE_DRAW_OFFSET, hexToBytes("CEDEEF17"))) return false
+        espSaved[base + STAGE_DRAW_OFFSET] = orig
+        return true
+    }
+
+    /** Toggling only changes a flags word — code bytes are never rewritten. */
+    fun setEspFlags(pid: Int, base: Long, boxes: Boolean, lines: Boolean) {
+        val flags = (if (boxes) 1 else 0) or (if (lines) 2 else 0)
+        writeBytes(
+            pid,
+            base + ESP_DATA_OFFSET,
+            ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(flags).array(),
+        )
+    }
+
+    fun uninstallInternalEsp(pid: Int, base: Long) {
+        setEspFlags(pid, base, false, false)
+        Thread.sleep(50)
+        espSaved.remove(base + STAGE_DRAW_OFFSET)?.let {
+            writeBytes(pid, base + STAGE_DRAW_OFFSET, it)
         }
     }
 }

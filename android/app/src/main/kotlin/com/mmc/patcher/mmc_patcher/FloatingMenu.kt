@@ -32,7 +32,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var expanded = false
     private var pid: Int? = null
     private var base: Long? = null
-    private var esp: EspOverlay? = null
+    private var espPid: Int? = null
+    private var espBase: Long? = null
+    private var espBoxes = false
+    private var espLines = false
     private var debug: DebugOverlay? = null
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
@@ -110,8 +113,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         icon = null
         panel = null
         expanded = false
-        esp?.hide()
-        esp = null
+        espPid?.let { p -> espBase?.let { b -> MemoryPatcher.setEspFlags(p, b, false, false) } }
         debug?.hide()
         debug = null
     }
@@ -488,13 +490,19 @@ internal class FloatingMenu(private val activity: MainActivity) {
     }
 
     private fun setEsp(boxes: Boolean? = null, lines: Boolean? = null) {
-        if (esp == null) esp = EspOverlay(activity)
-        if (boxes != null) esp?.setBoxes(boxes)
-        if (lines != null) esp?.setLines(lines)
-        if (esp?.isOff() == true) {
-            esp?.hide()
-            esp = null
+        if (boxes != null) espBoxes = boxes
+        if (lines != null) espLines = lines
+        val p = pid ?: return
+        val b = base ?: return
+        if (espPid != p || espBase != b) {
+            if (!MemoryPatcher.installInternalEsp(p, b)) {
+                toast("ESP install failed")
+                return
+            }
+            espPid = p
+            espBase = b
         }
+        MemoryPatcher.setEspFlags(p, b, espBoxes, espLines)
     }
 
     private fun toast(message: String) {
