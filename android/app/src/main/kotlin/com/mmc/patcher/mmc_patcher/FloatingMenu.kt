@@ -105,12 +105,14 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
     fun show() {
         if (icon != null) return
+        NativeInjector.onStateChanged = { refreshPanel() }
         activity.application.registerComponentCallbacks(configCallback)
         icon = buildIcon()
         wm.addView(icon, iconParams)
     }
 
     fun hide() {
+        NativeInjector.onStateChanged = null
         runCatching { activity.application.unregisterComponentCallbacks(configCallback) }
         icon?.let { runCatching { wm.removeView(it) } }
         panel?.let { runCatching { wm.removeView(it) } }
@@ -290,13 +292,13 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
         container.addView(statusCard())
         container.addView(sectionTitle("COMBAT"))
-        container.addView(groupRow("god", "HP", "God Mode", "Ignore all incoming damage", PATCH_GROUPS[0]))
-        container.addView(groupRow("ammo", "∞", "Infinite Ammo", "Clip and reserve never run dry", PATCH_GROUPS[1]))
-        container.addView(groupRow("security", "SH", "Security Bypass", "Hide H4X alerts · ballistics", PATCH_GROUPS[2]))
+        container.addView(groupRow("god", "HP", "God Mode", "Ignore all incoming damage", PATCH_GROUPS[0], 7))
+        container.addView(groupRow("ammo", "∞", "Infinite Ammo", "Clip and reserve never run dry", PATCH_GROUPS[1], 8))
+        container.addView(groupRow("security", "SH", "Security Bypass", "Hide H4X alerts · ballistics", PATCH_GROUPS[2], null))
 
         container.addView(sectionTitle("AIM  /  ESP"))
         container.addView(toggleRow("aim", "◎", "Aimlock", "Snap to the nearest enemy") { checked ->
-            toggleAimlock(checked)
+            if (NativeInjector.active) lglSet(6, checked) else toggleAimlock(checked)
         })
         container.addView(toggleRow("espBoxes", "▣", "ESP Boxes", "Outline targets through walls") { checked ->
             setEsp(boxes = checked)
@@ -305,6 +307,24 @@ internal class FloatingMenu(private val activity: MainActivity) {
         container.addView(toggleRow("espLines", "╱", "ESP Lines", "Draw lines to every target") { checked ->
             setEsp(lines = checked)
             true
+        })
+
+        container.addView(sectionTitle("INJECTOR  /  LGL"))
+        container.addView(toggleRow("lgl", "⬡", "Load LGL mod", "dlopen full mod into MMC · reverts local patches") { checked ->
+            if (!checked) {
+                PatchLogger.log("INJECTOR", "unload not supported; restart MMC to drop LGL")
+                toast("Restart MMC to unload LGL")
+                false
+            } else {
+                val result = NativeInjector.loadLgl(activity)
+                toast(if (result.ok) "LGL injected" else result.detail.take(60))
+                result.ok
+            }
+        })
+        container.addView(injectorStatusRow())
+        container.addView(actionRow("PoC marker dlopen", "Prove remote dlopen with a marker .so first") {
+            val result = NativeInjector.runMarker(activity)
+            toast(if (result.ok) "PoC OK" else result.detail.take(60))
         })
 
         container.addView(sectionTitle("DIAGNOSTICS"))
@@ -414,6 +434,75 @@ internal class FloatingMenu(private val activity: MainActivity) {
         }
     }
 
+    @SuppressLint("SetTextI18n")
+    private fun injectorStatusRow(): View {
+        val card = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(Color.rgb(25, 27, 36), dp(12).toFloat(), Color.rgb(45, 48, 61))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(2) }
+        }
+        card.addView(infoRow("LGL STATUS", NativeInjector.statusText(), if (NativeInjector.active) online else textDim))
+        val flags = pid?.let { LglControl.snapshot(it) } ?: "game not running"
+        card.addView(infoRow("LGL FLAGS", flags, textPrimary))
+        return card
+    }
+
+    private fun actionRow(title: String, subtitle: String, onClick: () -> Unit): View {
+        val texts = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(activity).apply { text = title; caption(12f, Color.WHITE, bold = true) })
+            addView(TextView(activity).apply { text = subtitle; caption(9.5f, textDim) })
+        }
+        return LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(11), dp(9), dp(11), dp(9))
+            minimumHeight = dp(52)
+            background = pressable(Color.rgb(40, 43, 56), Color.rgb(58, 62, 78), dp(12).toFloat(), stroke)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(7) }
+            addView(texts)
+            setOnClickListener { onClick() }
+        }
+    }
+
+    /** Routes a UI toggle to an LGL native flag when injector mode is active. */
+    private fun lglSet(feature: Int, on: Boolean): Boolean {
+        val p = MemoryPatcher.findPid()
+        if (p == null) {
+            toast("Launch MMC first")
+            return false
+        }
+        val ok = LglControl.setFeature(p, feature, on)
+        if (!ok) toast("LGL control failed")
+        return ok
+    }
+
+    /** Repaints after a load so pills reflect LGL ownership, not stale patches. */
+    private fun refreshPanel() {
+        if (NativeInjector.active) {
+            listOf("god", "ammo", "security", "aim", "espBoxes", "espLines").forEach { states.remove(it) }
+            espPid = null
+            espBase = null
+            espBoxes = false
+            espLines = false
+        }
+        if (!expanded || panel == null) return
+        panel?.let { runCatching { wm.removeView(it) } }
+        panel = buildPanel()
+        val (width, height) = panelSize()
+        panelParams.width = width
+        panelParams.height = height
+        wm.addView(panel, panelParams)
+    }
+
     // ---- toggle rows -----------------------------------------------------
 
     /**
@@ -438,12 +527,19 @@ internal class FloatingMenu(private val activity: MainActivity) {
         label: String,
         subtitle: String,
         group: PatchGroup,
+        lglFeature: Int? = null,
     ): View = toggleRow(key, glyph, label, subtitle) { checked ->
-        if (!ensureAttached()) {
-            toast("Launch MMC first")
-            false
-        } else {
-            applyGroup(pid!!, base!!, group, checked)
+        when {
+            NativeInjector.active && lglFeature != null -> lglSet(lglFeature, checked)
+            NativeInjector.active -> {
+                PatchLogger.log("INJECTOR", "$label is owned by LGL; no equivalent single flag")
+                true
+            }
+            !ensureAttached() -> {
+                toast("Launch MMC first")
+                false
+            }
+            else -> applyGroup(pid!!, base!!, group, checked)
         }
     }
 
@@ -536,6 +632,13 @@ internal class FloatingMenu(private val activity: MainActivity) {
     }
 
     private fun setEsp(boxes: Boolean? = null, lines: Boolean? = null) {
+        if (NativeInjector.active) {
+            // LGL's g_espEnabled drives boxes and lines together.
+            val on = boxes ?: lines ?: false
+            PatchLogger.log("ESP", "LGL g_espEnabled -> $on (boxes and lines share one flag)")
+            lglSet(0, on)
+            return
+        }
         if (boxes != null) espBoxes = boxes
         if (lines != null) espLines = lines
         if (!ensureAttached()) {

@@ -16,6 +16,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         PatchLogger.installCrashHandler(applicationContext)
+        NativeInjector.init(this)
         PatchLogger.log("APP", "launcher opened")
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -48,6 +49,17 @@ class MainActivity : FlutterActivity() {
                 }
                 "copyLogs" -> {
                     result.success(if (PatchLogger.copyToClipboard(this@MainActivity)) "copied" else "failed")
+                }
+                "injectorStatus" -> {
+                    result.success(NativeInjector.statusText())
+                }
+                "loadLgl" -> {
+                    val res = NativeInjector.loadLgl(this@MainActivity)
+                    result.success(if (res.ok) "ok: ${res.detail}" else "error: ${res.detail}")
+                }
+                "pocMarker" -> {
+                    val res = NativeInjector.runMarker(this@MainActivity)
+                    result.success(if (res.ok) "ok: ${res.detail}" else "error: ${res.detail}")
                 }
                 else -> result.notImplemented()
             }

@@ -139,7 +139,7 @@ internal object MemoryPatcher {
         null
     }
 
-    private fun readBytes(pid: Int, address: Long, length: Int): ByteArray? {
+    internal fun readBytes(pid: Int, address: Long, length: Int): ByteArray? {
         val mem = openMem(pid, "r") ?: return null
         return try {
             mem.seek(address)
@@ -164,7 +164,7 @@ internal object MemoryPatcher {
     private fun readDouble(pid: Int, address: Long): Double? =
         readBytes(pid, address, 8)?.let { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).double }
 
-    private fun writeBytes(pid: Int, address: Long, bytes: ByteArray): Boolean {
+    internal fun writeBytes(pid: Int, address: Long, bytes: ByteArray): Boolean {
         val mem = openMem(pid, "rw") ?: return writeViaShell(pid, address, bytes)
         return try {
             mem.seek(address)

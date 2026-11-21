@@ -36,6 +36,22 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        ndk {
+            // Target device is ARM64 only; keep the injector helper small.
+            abiFilters += listOf("arm64-v8a")
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_static")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     signingConfigs {
@@ -68,4 +84,13 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// CMake copies the su-run injector CLI into src/main/assets after compiling it.
+// Force native build ahead of asset merging so the CLI is inside the APK.
+val nativeBuildTasks = tasks.matching {
+    it.name == "externalNativeBuildDebug" || it.name == "externalNativeBuildRelease"
+}
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(nativeBuildTasks)
 }

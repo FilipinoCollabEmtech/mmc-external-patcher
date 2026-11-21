@@ -38,6 +38,7 @@ class PatcherHome extends StatefulWidget {
 
 class _PatcherHomeState extends State<PatcherHome> {
   String _status = 'Tap Launch to open the floating menu.';
+  String _injector = 'Injector status not checked yet.';
 
   Future<void> _start() async {
     String? result;
@@ -68,6 +69,19 @@ class _PatcherHomeState extends State<PatcherHome> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(result == 'copied' ? 'Logs copied to clipboard' : 'Copy failed: $result')),
     );
+  }
+
+  Future<void> _refreshInjector() async {
+    String? result;
+    try {
+      result = await _channel.invokeMethod<String>('injectorStatus');
+    } on PlatformException catch (e) {
+      result = 'error: ${e.message}';
+    }
+    if (!mounted) return;
+    setState(() {
+      _injector = result ?? 'Injector status unavailable';
+    });
   }
 
   @override
@@ -105,11 +119,23 @@ class _PatcherHomeState extends State<PatcherHome> {
                 icon: const Icon(Icons.copy),
                 label: const Text('Copy logs'),
               ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: _refreshInjector,
+                icon: const Icon(Icons.memory),
+                label: const Text('Injector status'),
+              ),
               const SizedBox(height: 20),
               Text(
                 _status,
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _injector,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
           ),
