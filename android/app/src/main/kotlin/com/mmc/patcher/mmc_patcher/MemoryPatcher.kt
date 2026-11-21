@@ -42,6 +42,9 @@ internal object MemoryPatcher {
     private const val TARGET_LIB = "libcocos2dcpp.so"
 
     private const val FIRE_ANGLE_OFFSET = 0x6888f0L
+    // Scratch floats in .bss (writable): flag=1 -> return locked angle, flag=0 -> native getter.
+    private const val AIM_FLAG_ADDR = 0x13f4700L
+    private const val AIM_ANGLE_ADDR = 0x13f4704L
     private const val LOCAL_CONTROLLER_GLOBAL = 0x13bec80L
     private const val REMOTE_PLAYERS_GLOBAL = 0x13bf260L
     private const val ALL_DRONES_GLOBAL = 0x13be0a0L
@@ -144,6 +147,10 @@ internal object MemoryPatcher {
 
     private fun writeFloat(pid: Int, address: Long, value: Float) {
         writeBytes(pid, address, ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array())
+    }
+
+    private fun writeInt(pid: Int, address: Long, value: Int) {
+        writeBytes(pid, address, ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array())
     }
 
     private fun writeViaShell(pid: Int, address: Long, bytes: ByteArray): Boolean {
@@ -350,17 +357,10 @@ internal object MemoryPatcher {
         for (off in longArrayOf(0x298, 0x29c, 0x2a4)) writeBytes(pid, view + off, zero)
     }
 
-    /** Base firing angle from SoldierView::getFiringAngle with sway zeroed: view+0x2a0. */
-    private fun baseAngle(pid: Int, lc: Long): Float? {
-        val view = readLong(pid, lc + 0x150) ?: return null
-        if (view == 0L) return null
-        return readFloat(pid, view + 0x2a0)
-    }
-
-    private fun aimAngle(pid: Int, base: Long): Float? {
+    /** Returns the angle to the nearest enemy, or null when there is no target. */
+    private fun targetAngle(pid: Int, base: Long): Float? {
         val lc = localController(pid, base) ?: return null
-        zeroSway(pid, lc)
-        val origin = soldierPosition(pid, lc) ?: return baseAngle(pid, lc)
+        val origin = soldierPosition(pid, lc) ?: return null
         var best = 4000.0
         var found: Float? = null
         for (t in collectTargets(pid, base)) {
@@ -373,9 +373,24 @@ internal object MemoryPatcher {
             if (deg < 0f) deg += 360f
             found = deg
         }
-        // No target: return the live native angle so aim never freezes.
-        return found ?: baseAngle(pid, lc)
+        if (found != null) zeroSway(pid, lc)
+        return found
     }
+
+    /**
+     * Conditional getter: when the flag is set, return the locked angle;
+     * otherwise execute the original getter payload `ldr s0,[x0,#0x180]; ret`.
+     * This preserves normal joystick control whenever no target is locked.
+     */
+    private val conditionalFireAngleStub = byteArrayOf(
+        0x68.toByte(), 0x6B.toByte(), 0x00.toByte(), 0x90.toByte(), // adrp x8, page(0x13f4700)
+        0x09.toByte(), 0x01.toByte(), 0x5C.toByte(), 0x39.toByte(), // ldrb w9, [x8, #0x700]  -> flag
+        0x69.toByte(), 0x00.toByte(), 0x00.toByte(), 0x34.toByte(), // cbz w9, +3 insns -> native
+        0x00.toByte(), 0x05.toByte(), 0x47.toByte(), 0xBD.toByte(), // ldr s0, [x8, #0x704]  -> locked angle
+        0xC0.toByte(), 0x03.toByte(), 0x5F.toByte(), 0xD6.toByte(), // ret
+        0x00.toByte(), 0x80.toByte(), 0x41.toByte(), 0xBD.toByte(), // ldr s0, [x0, #0x180]  -> original getter
+        0xC0.toByte(), 0x03.toByte(), 0x5F.toByte(), 0xD6.toByte(), // ret
+    )
 
     fun toggleAimlock(enable: Boolean): Boolean {
         if (enable) {
@@ -385,15 +400,10 @@ internal object MemoryPatcher {
             val original = readBytes(pid, address, 24) ?: return false
             originals[address] = original
 
-            val patch = ByteArray(24)
-            patch[0] = 0x68.toByte(); patch[1] = 0x00.toByte(); patch[2] = 0x00.toByte(); patch[3] = 0x10.toByte()
-            patch[4] = 0x00.toByte(); patch[5] = 0x01.toByte(); patch[6] = 0x40.toByte(); patch[7] = 0xBD.toByte()
-            patch[8] = 0xC0.toByte(); patch[9] = 0x03.toByte(); patch[10] = 0x5F.toByte(); patch[11] = 0xD6.toByte()
-            for (i in 16 until 24 step 4) {
-                patch[i] = 0x1F.toByte(); patch[i + 1] = 0x20.toByte()
-                patch[i + 2] = 0x03.toByte(); patch[i + 3] = 0xD5.toByte()
-            }
-            if (!writeBytes(pid, address, patch)) return false
+            // Start disabled so the first tick can't return a stale locked angle.
+            writeInt(pid, base + AIM_FLAG_ADDR, 0)
+            writeFloat(pid, base + AIM_ANGLE_ADDR, 0f)
+            if (!writeBytes(pid, address, conditionalFireAngleStub)) return false
 
             aimRunning = true
             aimThread = Thread {
@@ -401,7 +411,14 @@ internal object MemoryPatcher {
                     val p = findPid()
                     val b = p?.let { findModuleBase(it) }
                     if (p != null && b != null) {
-                        aimAngle(p, b)?.let { writeFloat(p, b + FIRE_ANGLE_OFFSET + 12, it) }
+                        val angle = targetAngle(p, b)
+                        if (angle != null) {
+                            writeFloat(p, b + AIM_ANGLE_ADDR, angle)
+                            writeInt(p, b + AIM_FLAG_ADDR, 1)
+                        } else {
+                            // No target: let the stub fall through to the real getter.
+                            writeInt(p, b + AIM_FLAG_ADDR, 0)
+                        }
                     }
                     try {
                         Thread.sleep(16)
@@ -422,6 +439,7 @@ internal object MemoryPatcher {
             aimThread = null
             val pid = findPid() ?: return false
             val base = findModuleBase(pid) ?: return false
+            writeInt(pid, base + AIM_FLAG_ADDR, 0)
             val original = originals.remove(base + FIRE_ANGLE_OFFSET) ?: return false
             return writeBytes(pid, base + FIRE_ANGLE_OFFSET, original)
         }
