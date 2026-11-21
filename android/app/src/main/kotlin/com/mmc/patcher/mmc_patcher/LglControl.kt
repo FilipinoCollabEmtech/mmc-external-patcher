@@ -109,20 +109,21 @@ internal object LglControl {
     fun loadedPath(pid: Int): String? = findPath(pid, LGL_LIB)
 
     internal fun findPath(pid: Int, needle: String): String? {
-        return try {
+        var found: String? = null
+        try {
             File("/proc/$pid/maps").forEachLine { line ->
-                if (line.contains(needle)) {
+                if (found == null && line.contains(needle)) {
                     // Pathname is the final whitespace-delimited field of a maps line.
                     val trimmed = line.trim()
                     val lastSpace = trimmed.lastIndexOf(' ')
                     if (lastSpace >= 0 && lastSpace + 1 < trimmed.length) {
-                        return trimmed.substring(lastSpace + 1)
+                        found = trimmed.substring(lastSpace + 1)
                     }
                 }
             }
-            null
         } catch (_: Exception) {
-            null
+            // Unreadable maps.
         }
+        return found
     }
 }

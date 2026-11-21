@@ -164,13 +164,13 @@ int injector_inject(pid_t pid, const char *path) {
     /* Remote mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON, size=kRegionSize). */
     struct user_regs_struct r = saved;
     r.pc = remote_mmap;
-    r.x[0] = 0;
-    r.x[1] = kRegionSize;
-    r.x[2] = 7;    /* PROT_READ | PROT_WRITE | PROT_EXEC */
-    r.x[3] = 0x22; /* MAP_PRIVATE | MAP_ANONYMOUS */
-    r.x[4] = (uint64_t)-1;
-    r.x[5] = 0;
-    r.lr = 0;      /* return target traps -> we catch the fault */
+    r.regs[0] = 0;
+    r.regs[1] = kRegionSize;
+    r.regs[2] = 7;    /* PROT_READ | PROT_WRITE | PROT_EXEC */
+    r.regs[3] = 0x22; /* MAP_PRIVATE | MAP_ANONYMOUS */
+    r.regs[4] = (uint64_t)-1;
+    r.regs[5] = 0;
+    r.regs[30] = 0;      /* return target traps -> we catch the fault */
     if (ptrace(PTRACE_SETREGS, pid, 0, &r) == -1) {
         LOGE("SETREGS (mmap) failed: %s", strerror(errno));
         rc = INJECT_ERR_SETREGS;
@@ -189,7 +189,7 @@ int injector_inject(pid_t pid, const char *path) {
             rc = INJECT_ERR_GETREGS;
             goto restore_and_detach;
         }
-        uintptr_t rwx = (uintptr_t)after_mmap.x[0];
+        uintptr_t rwx = (uintptr_t)after_mmap.regs[0];
         if (!rwx || rwx == (uintptr_t)-1) {
             LOGE("remote mmap returned 0x%llx", (unsigned long long)rwx);
             rc = INJECT_ERR_RWX;
@@ -237,9 +237,9 @@ int injector_inject(pid_t pid, const char *path) {
         r = saved;
         r.pc = rwx;
         r.sp = rwx + kRegionSize;   /* private, 16-byte aligned stack */
-        r.lr = rwx + kTrapOff;      /* brk #0 after payload returns    */
-        r.x[0] = path_ptr;
-        r.x[1] = 2;
+        r.regs[30] = rwx + kTrapOff;      /* brk #0 after payload returns    */
+        r.regs[0] = path_ptr;
+        r.regs[1] = 2;
         if (ptrace(PTRACE_SETREGS, pid, 0, &r) == -1) {
             LOGE("SETREGS (payload) failed: %s", strerror(errno));
             rc = INJECT_ERR_SETREGS;

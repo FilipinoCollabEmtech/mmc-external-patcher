@@ -24,6 +24,7 @@ internal object NativeInjector {
     private const val CLI_REMOTE = "/data/local/tmp/mmc_injector_cli"
 
     private val jniAvailable = runCatching { System.loadLibrary("injector") }.isSuccess
+    private external fun nativeInject(pid: Int, path: String): Int
     @Volatile private var appContext: Context? = null
 
     @Volatile var active = false
