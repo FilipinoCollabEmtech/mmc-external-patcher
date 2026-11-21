@@ -1,50 +1,42 @@
-# MMC External Patcher
+# MMC Patcher
 
-A Flutter APK that patches **Mini Militia Classic** (`com.appsomniacs.mmc`) memory from outside the game. It mirrors the logic used by Android injector tools: find the process, locate the library base in `/proc/<pid>/maps`, and write raw bytes to `/proc/<pid>/mem`.
+A Flutter APK with a **floating overlay injector**, structured like the ALP/ChoRok injectors: the app itself has one Launch button; every toggle lives in the floating icon that appears over the game.
 
-## How it works
+## Layout
 
-1. `findPid()` scans `/proc` for a `cmdline` matching `com.appsomniacs.mmc`.
-2. `findModuleBase()` reads `/proc/<pid>/maps` and takes the first mapping line containing `libcocos2dcpp.so`.
-3. Each patch writes bytes at `module_base + offset`:
-   - direct `dart:io` write to `/proc/<pid>/mem`, or
-   - fallback through `su -c "printf ... | dd of=/proc/<pid>/mem ..."` for rooted devices.
+- **App screen** — only a Launch button. It requests "Display over other apps" if needed, adds the floating icon, launches Mini Militia, and moves itself to the background.
+- **Floating icon** — a draggable "MMC" badge. Tap it to expand/collapse the patch panel.
+- **Patch panel** — switches for God Mode (4 damage functions) and Infinite Ammo/Clip, each calling the memory patch directly.
 
-`lib/memory_patcher.dart` holds the engine; `lib/main.dart` is the UI. `MainActivity.kt` exposes a MethodChannel that launches MMC via `getLaunchIntentForPackage()`.
+## Mechanism (from the ALP / ChoRok source)
 
-## Built-in patches
+`android/app/src/main/kotlin/.../MemoryPatcher.kt` mirrors the injector logic:
 
-Offsets come from the function addresses in `lgl_project/jni/Main.cpp` (`D:\mm_work`), converted to ARM64 byte overwrites:
+1. scan `/proc` for a `cmdline` matching `com.appsomniacs.mmc` → PID
+2. read `/proc/<pid>/maps`, first line containing `libcocos2dcpp.so` → base
+3. write bytes at `base + offset` into `/proc/<pid>/mem` (direct write, `su`+`dd` fallback)
 
-| Group | Offset | Bytes | Effect |
-|---|---|---|---|
-| God Mode | `0x67cffc` | `C0 03 5F D6` | Humanoid damage → `ret` |
-| God Mode | `0x677130` | `C0 03 5F D6` | Hawk damage → `ret` |
-| God Mode | `0x95e4c0` | `C0 03 5F D6` | Worm damage → `ret` |
-| God Mode | `0x8e2864` | `C0 03 5F D6` | SoldierController damage → `ret` |
-| Infinite Ammo | `0x947a20` | `00 A6 8E 52 C0 03 5F D6` | `getAmmo` → 30000 |
-| Infinite Ammo | `0x947954` | `00 A6 8E 52 C0 03 5F D6` | `getClip` → 30000 |
+Offsets come from `lgl_project/jni/Main.cpp`:
+`0x67cffc`, `0x677130`, `0x95e4c0`, `0x8e2864` → `C0 03 5F D6` (`ret`, damage disabled);
+`0x947a20`, `0x947954` → `00 A6 8E 52 C0 03 5F D6` (`mov w0,#30000; ret`, ammo refill).
 
-The **Custom patch** form accepts any library, hex offset, and hex byte string, so more patches can be added without rebuilding.
-
-## Access requirement
-
-Writing another app's `/proc/<pid>/mem` needs either a rooted device (`su`) or a virtual container that runs MMC in a process this patcher owns. On a stock non-rooted install the write will fail and the app will report it in the status line.
+Writing another app's memory needs root (`su`) or a virtual container that owns the MMC process.
 
 ## Build
 
-The APK is built in the cloud by `.github/workflows/flutter.yml` (the same pattern as the SeeRuta builder workflow):
+`.github/workflows/flutter.yml` (same pattern as the SeeRuta builder workflow) builds and signs the release APK on every push to `main`, or manually:
 
-- on every push to `main`, or manually with `gh workflow run flutter.yml`
-- Java 17 + Flutter stable, release build signed with the shared JKS
-- signing secrets: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`
-- outputs `app-debug.apk` and `app-release.apk` as artifacts and in a GitHub Release
+```
+gh workflow run flutter.yml --repo FilipinoCollabEmtech/mmc-external-patcher
+```
+
+Signing secrets: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`.
 
 ## Usage
 
-1. Install `MMC_External_Patcher_release.apk`.
-2. Open it and tap **Launch Game**.
-3. Wait for a match to load, then tap **Attach** (status shows PID and library base).
-4. Toggle God Mode / Infinite Ammo, or enter a custom patch.
+1. Install the APK and open it.
+2. Tap **Launch**; allow "Display over other apps" if prompted, then tap Launch again.
+3. The MMC badge appears over the game. Tap it to open the toggle panel.
+4. Drag the badge/panel to reposition; tap **MINIMIZE** to collapse back to the icon.
 
 Repository: https://github.com/FilipinoCollabEmtech/mmc-external-patcher
