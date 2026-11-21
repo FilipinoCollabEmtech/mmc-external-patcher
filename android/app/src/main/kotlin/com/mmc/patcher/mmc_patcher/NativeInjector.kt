@@ -90,28 +90,38 @@ internal object NativeInjector {
         }
     }
 
-    /** Picks the game's real lib directory (VirtualApp-aware) via /proc maps. */
-    private fun targetLibDir(pid: Int): Pair<String, String?> {
-        val gameLib = LglControl.findPath(pid, "libcocos2dcpp.so")
-        if (gameLib != null) {
-            val dir = File(gameLib).parent
-            if (!dir.isNullOrBlank()) return dir to gameLib
-        }
-        PatchLogger.log(TAG, "game lib path not in maps; falling back to /data/local/tmp")
-        return "/data/local/tmp" to null
+    private fun gameUid(pid: Int): String? = try {
+        File("/proc/$pid/status").readLines()
+            .firstOrNull { it.startsWith("Uid:") }
+            ?.split(Regex("\\s+"))
+            ?.getOrNull(1)
+    } catch (_: Exception) {
+        null
     }
 
+    /**
+     * /data/app/<pkg>/lib/arm64 is read-only, so stage into the game's own
+     * writable files directory with the game UID; fall back to /data/local/tmp.
+     */
     private fun stageIntoGame(pid: Int, localPath: String, destName: String): String? {
-        val (dir, reference) = targetLibDir(pid)
-        val dest = "$dir/$destName"
-        val refPart = reference?.let { "chcon --reference='$it' '$dest' 2>/dev/null;" }.orEmpty()
-        val cmd = "mkdir -p '$dir' && cp '$localPath' '$dest' && chmod 755 '$dest'; $refPart true"
-        val rc = runSu(cmd)
-        if (rc != 0) {
-            PatchLogger.log(TAG, "staging failed rc=$rc dest=$dest")
-            return null
+        val uid = gameUid(pid)
+        val candidates = listOf(
+            "/data/data/$TARGET_PACKAGE/files",
+            "/data/user/0/$TARGET_PACKAGE/files",
+            "/data/local/tmp",
+        )
+        for (dir in candidates) {
+            val dest = "$dir/$destName"
+            val owner = uid?.let { "chown $it:$it '$dest' && " }.orEmpty()
+            val cmd = "mkdir -p '$dir' && cp '$localPath' '$dest' && ${owner}chmod 755 '$dest' 2>&1; echo RC=\$?"
+            val out = runSuCapture(cmd)
+            if (out.contains("RC=0")) {
+                PatchLogger.log(TAG, "staged $destName -> $dest uid=$uid")
+                return dest
+            }
+            PatchLogger.log(TAG, "stage candidate failed dest=$dest out=${out.trim().take(200)}")
         }
-        return dest
+        return null
     }
 
     private fun stageCli(context: Context): String? {

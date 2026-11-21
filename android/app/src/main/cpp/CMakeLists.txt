@@ -23,3 +23,6 @@ set_target_properties(injector_cli PROPERTIES
 # Phase-1 PoC payload: a trivial .so whose constructor writes a marker file.
 # dlopen()-ing this first proves remote loading works before the full LGL mod.
 add_library(marker SHARED marker.c)
+# extractNativeLibs=false means nativeLibraryDir may be empty; ship it as an asset.
+set_target_properties(marker PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../assets")
