@@ -170,17 +170,55 @@ internal object NativeInjector {
         return InjectResult(false, attempts.joinToString("; ").ifBlank { "no injector path available" })
     }
 
-    /** Try our own readable path first; only fall back to root staging if needed. */
-    private fun loadSo(pid: Int, local: String, destName: String): InjectResult {
-        val direct = inject(pid, local)
-        if (direct.ok) return direct
-        val staged = stageIntoGame(pid, local, destName)
-        if (staged != null && staged != local) {
-            val retry = inject(pid, staged)
-            if (retry.ok) return retry
-            return InjectResult(false, "${direct.detail}; staged retry: ${retry.detail}")
+    /**
+     * Both apps live under the same VirtualApp host, so the game's virtual data
+     * dir is writable by us without root. Derive it from our own wrapped path.
+     */
+    private fun stageViaVirtualApp(local: String, destName: String): String? {
+        val own = appContext?.filesDir?.absolutePath ?: return null
+        val marker = "/data/user/0/"
+        val idx = own.indexOf(marker)
+        if (idx < 0) {
+            PatchLogger.log(TAG, "cannot derive VA root from $own")
+            return null
         }
-        return direct
+        val root = own.substring(0, idx)
+        val dir = File("$root${marker}$TARGET_PACKAGE/files")
+        val dest = File(dir, destName)
+        return try {
+            dir.mkdirs()
+            File(local).copyTo(dest, overwrite = true)
+            dest.setReadable(true, false)
+            dest.setExecutable(true, false)
+            PatchLogger.log(TAG, "VA staged $destName -> ${dest.absolutePath}")
+            dest.absolutePath
+        } catch (e: Exception) {
+            PatchLogger.log(TAG, "VA staging failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Try our own path, then the game's virtual data dir; root staging is last. */
+    private fun loadSo(pid: Int, local: String, destName: String): InjectResult {
+        val attempts = mutableListOf<String>()
+        var result = inject(pid, local)
+        if (result.ok) return result
+        attempts += "own path: ${result.detail}"
+
+        val vaPath = stageViaVirtualApp(local, destName)
+        if (vaPath != null) {
+            result = inject(pid, vaPath)
+            if (result.ok) return result
+            attempts += "VA path: ${result.detail}"
+        }
+
+        val staged = stageIntoGame(pid, local, destName)
+        if (staged != null && staged != local && staged != vaPath) {
+            result = inject(pid, staged)
+            if (result.ok) return result
+            attempts += "root path: ${result.detail}"
+        }
+        return InjectResult(false, attempts.joinToString("; "))
     }
 
     fun loadLgl(context: Context): InjectResult {
