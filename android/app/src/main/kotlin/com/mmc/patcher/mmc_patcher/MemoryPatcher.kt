@@ -46,18 +46,15 @@ internal object MemoryPatcher {
     private const val ALL_DRONES_GLOBAL = 0x13be0a0L
     private const val DIRECTOR_GLOBAL = 0x13ec228L
     private const val CAM_POINT_GLOBAL = 0x13c1008L
+    private const val WORLD_LAYER_GLOBAL = 0x13be0ef8L
 
-    // Code cave and scratch (verified zero-filled RX region / RW .bss gap).
-    private const val CAVE = 0xfbcac0L
-    private const val SCRATCH = 0x13f4000L
     private const val LOS_SLOT = 0x13f4700L
     private const val JOYPAD_SLOT = 0x13f4780L
     private const val MAP_MANAGER_GLOBAL = 0x13be02c0L
     private const val FIRE_ANGLE = 0x6888f0L
 
-    // Assembled with NDK clang from cave.s (BL cave; RET; <clear>; <blocked>; NOP; NOP).
-    private val STUB_HEX = "74D0249468000010000140BDC0035FD6000000001F2003D5"
-    private val CAVE_HEX = "F0031EAAD1000058100211CBD20000585202108B400200F9C0035FD6F48868000000000080473F0100000000"
+    // NOP; ADR x8,#12; LDR s0,[x8]; RET; <float>; NOP. No cave: BL clobbers LR and loops.
+    private val STUB_HEX = "1F2003D568000010000140BDC0035FD6000000001F2003D5"
 
     private val originals = HashMap<Long, ByteArray>()
     private var comboThread: Thread? = null
@@ -67,6 +64,7 @@ internal object MemoryPatcher {
     @Volatile private var selectedTarget: EspTarget? = null
     @Volatile private var lastLosClear = false
     @Volatile private var lastAimDeg = 0f
+    @Volatile private var fireLatched = false
 
     fun findPid(): Int? {
         val procs = File("/proc").listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) }
@@ -281,44 +279,37 @@ internal object MemoryPatcher {
         return Camera(camX, camY, width, height)
     }
 
-    /** Project a chipmunk world point through the world-layer node chain into overlay pixels. */
+    /** World -> screen using the game's camera + the dynamic world-layer scale. */
     fun projectWorld(pid: Int, base: Long, x: Double, y: Double, viewW: Int, viewH: Int): Pair<Float, Float>? {
         val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
         val winW = readFloat(pid, director + 0xd0) ?: return null
         val winH = readFloat(pid, director + 0xd4) ?: return null
-        val holder = readLong(pid, base + 0x13c0678) ?: return null
-        var node = readLong(pid, holder) ?: return null
-        var px = x.toFloat()
-        var py = y.toFloat()
-        var depth = 0
-        while (node != 0L && depth++ < 10) {
-            val sx = readFloat(pid, node + 0x20) ?: 1f
-            val sy = readFloat(pid, node + 0x24) ?: 1f
-            val ox = readFloat(pid, node + 0x2c) ?: 0f
-            val oy = readFloat(pid, node + 0x30) ?: 0f
-            px = px * sx + ox
-            py = py * sy + oy
-            node = readLong(pid, node + 0xc0) ?: 0L
-        }
-        val scaleX = viewW / winW
-        val scaleY = viewH / winH
-        return px * scaleX to (viewH - py * scaleY)
+        val camPoint = readLong(pid, base + CAM_POINT_GLOBAL) ?: return null
+        val camX = readFloat(pid, camPoint) ?: return null
+        val camY = readFloat(pid, camPoint + 4) ?: return null
+
+        // Stage::updateViewV4 writes getViewScaleV4() into worldLayer+0x20 every frame.
+        val layerHolder = readLong(pid, base + WORLD_LAYER_GLOBAL) ?: return null
+        val worldLayer = readLong(pid, layerHolder) ?: return null
+        val s = readFloat(pid, worldLayer + 0x20)?.takeIf { it > 0.01f && it < 10f } ?: 1f
+
+        val designX = (x - camX).toFloat() * s + winW / 2f
+        val designY = (y - camY).toFloat() * s + winH / 2f
+        return designX * (viewW / winW) to (viewH - designY * (viewH / winH))
     }
 
     // ---- LOS cave ----
 
-    private fun installCave(pid: Int, base: Long): Boolean {
+    private fun installStub(pid: Int, base: Long): Boolean {
         val stubAddr = base + FIRE_ANGLE
         if (!originals.containsKey(stubAddr)) {
             val original = readBytes(pid, stubAddr, 24) ?: return false
             originals[stubAddr] = original
         }
-        if (!writeBytes(pid, base + CAVE, hexToBytes(CAVE_HEX))) return false
-        if (!writeBytes(pid, stubAddr, hexToBytes(STUB_HEX))) return false
-        return true
+        return writeBytes(pid, stubAddr, hexToBytes(STUB_HEX))
     }
 
-    private fun uninstallCave(pid: Int, base: Long) {
+    private fun uninstallStub(pid: Int, base: Long) {
         val original = originals.remove(base + FIRE_ANGLE) ?: return
         writeBytes(pid, base + FIRE_ANGLE, original)
     }
@@ -410,7 +401,7 @@ internal object MemoryPatcher {
         if (comboRunning) return
         val pid = findPid() ?: return
         val base = findModuleBase(pid) ?: return
-        if (!installCave(pid, base)) return
+        if (!installStub(pid, base)) return
         comboRunning = true
         comboThread = Thread {
             while (comboRunning) {
@@ -461,11 +452,13 @@ internal object MemoryPatcher {
                         writeFloat(p, stub + 16, live ?: baseAngle)
                     }
 
-                    if (triggerEnabled && joypad != null && selectedTarget != null && lastLosClear) {
-                        // Aimlock already points us at the target; hold fire briefly.
+                    val shouldFire = triggerEnabled && joypad != null && selectedTarget != null && lastLosClear
+                    if (shouldFire && !fireLatched && joypad != null) {
                         writeBytes(p, joypad + 0x18a, byteArrayOf(1))
-                    } else if (joypad != null) {
+                        fireLatched = true
+                    } else if (!shouldFire && fireLatched && joypad != null) {
                         writeBytes(p, joypad + 0x18a, byteArrayOf(0))
+                        fireLatched = false
                     }
                 }
                 try {
@@ -491,7 +484,7 @@ internal object MemoryPatcher {
                 // Ignore.
             }
             comboThread = null
-            uninstallCave(pid, base)
+            uninstallStub(pid, base)
         }
         return true
     }
@@ -500,6 +493,10 @@ internal object MemoryPatcher {
         val pid = findPid() ?: return false
         val base = findModuleBase(pid) ?: return false
         triggerEnabled = enable
+        if (!enable) {
+            fireLatched = false
+            findJoypad(pid, base)?.let { writeBytes(pid, it + 0x18a, byteArrayOf(0)) }
+        }
         if (enable) startCombo()
         if (!enable && !aimEnabled) {
             comboRunning = false
@@ -510,7 +507,7 @@ internal object MemoryPatcher {
                 // Ignore.
             }
             comboThread = null
-            uninstallCave(pid, base)
+            uninstallStub(pid, base)
         }
         return true
     }
@@ -523,6 +520,8 @@ internal object MemoryPatcher {
         sb.appendLine("cam=${cam?.x?.toInt()},${cam?.y?.toInt()} win=${cam?.width?.toInt()}x${cam?.height?.toInt()}")
         val proj = localPosition(pid, base)?.let { projectWorld(pid, base, it.first, it.second, 1548, 718) }
         sb.appendLine("playerProjected(1548x718)=${proj?.first?.toInt()},${proj?.second?.toInt()}")
+        val wl = readLong(pid, base + WORLD_LAYER_GLOBAL)?.let { readLong(pid, it) }
+        sb.appendLine("worldLayer=${hex(wl)} S=${wl?.let { readFloat(pid, it + 0x20) }}")
         val lc = localController(pid, base)
         sb.appendLine("localCtrl=${hex(lc)} pos=${localPosition(pid, base)?.first?.toInt()},${localPosition(pid, base)?.second?.toInt()}")
         val tList = collectTargets(pid, base)
