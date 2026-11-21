@@ -58,7 +58,7 @@ internal object MemoryPatcher {
 
     // Assembled with NDK clang from cave.s (BL cave; RET; <clear>; <blocked>; NOP; NOP).
     private val STUB_HEX = "74 D0 24 94 C0 03 5F D6 00 00 00 00 00 00 00 00 1F 20 03 D5 1F 20 03 D5"
-    private val CAVE_HEX = "FF8300D1FD7B01A9B0020058000200F9B0010058E00310AAB101005820023FD6300200580002003970010058111200911012919A000240BDFD7B41A9FF830091C0035FD600403F01000000002C9E610000000000F88868000000000080473F010000000000473F0100000000"
+    private val CAVE_HEX = "FFC300D1FD7B02A9F35301A9F3031EAA34040058730214CB300400581002138B000200F9100400581002138B100240F9500100B4100240F9100100B4900300581002138BE00310AA710300583102138B20023FD60200001420008052100300581002138B00020039F00200581002138B1112009160000034000240BD02000014200240BDF35341A9FD7B42A9FFC30091C0035FD6F48868000000000080473F0100000000F80D3C010000000000403F01000000002C9E61000000000000473F0100000000F888680000000000"
 
     private val originals = HashMap<Long, ByteArray>()
     private var comboThread: Thread? = null
@@ -282,6 +282,30 @@ internal object MemoryPatcher {
         return Camera(camX, camY, width, height)
     }
 
+    /** Project a chipmunk world point through the world-layer node chain into overlay pixels. */
+    fun projectWorld(pid: Int, base: Long, x: Double, y: Double, viewW: Int, viewH: Int): Pair<Float, Float>? {
+        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
+        val winW = readFloat(pid, director + 0xd0) ?: return null
+        val winH = readFloat(pid, director + 0xd4) ?: return null
+        val holder = readLong(pid, base + 0x13c0678) ?: return null
+        var node = readLong(pid, holder) ?: return null
+        var px = x.toFloat()
+        var py = y.toFloat()
+        var depth = 0
+        while (node != 0L && depth++ < 10) {
+            val sx = readFloat(pid, node + 0x20) ?: 1f
+            val sy = readFloat(pid, node + 0x24) ?: 1f
+            val ox = readFloat(pid, node + 0x2c) ?: 0f
+            val oy = readFloat(pid, node + 0x30) ?: 0f
+            px = px * sx + ox
+            py = py * sy + oy
+            node = readLong(pid, node + 0xc0) ?: 0L
+        }
+        val scaleX = viewW / winW
+        val scaleY = viewH / winH
+        return px * scaleX to (viewH - py * scaleY)
+    }
+
     // ---- LOS cave ----
 
     private fun installCave(pid: Int, base: Long): Boolean {
@@ -494,6 +518,8 @@ internal object MemoryPatcher {
         sb.appendLine("pid=$pid base=0x${base.toString(16)}")
         val cam = camera(pid, base)
         sb.appendLine("cam=${cam?.x?.toInt()},${cam?.y?.toInt()} win=${cam?.width?.toInt()}x${cam?.height?.toInt()}")
+        val proj = localPosition(pid, base)?.let { projectWorld(pid, base, it.first, it.second, 1548, 718) }
+        sb.appendLine("playerProjected(1548x718)=${proj?.first?.toInt()},${proj?.second?.toInt()}")
         val lc = localController(pid, base)
         sb.appendLine("localCtrl=${hex(lc)} pos=${localPosition(pid, base)?.first?.toInt()},${localPosition(pid, base)?.second?.toInt()}")
         sb.appendLine("targets=${collectTargets(pid, base).size} selected=${selectedTarget?.kind} aim=${lastAimDeg.toInt()}")

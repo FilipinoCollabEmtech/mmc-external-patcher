@@ -22,6 +22,7 @@ internal class EspOverlay(private val activity: MainActivity) {
     @Volatile private var boxes = false
     @Volatile private var lines = false
     @Volatile private var targets = emptyList<EspTarget>()
+    @Volatile private var worldPoints = mutableListOf<Pair<EspTarget, Pair<Float, Float>>>()
     @Volatile private var origin: Pair<Float, Float>? = null
     @Volatile private var cam: Camera? = null
 
@@ -50,12 +51,14 @@ internal class EspOverlay(private val activity: MainActivity) {
                 if (p != null && b != null) {
                     targets = collectTargets(p, b)
                     cam = camera(p, b)
+                    val vw = view?.width ?: 1
+                    val vh = view?.height ?: 1
+                    worldPoints.clear()
+                    for (t in targets) {
+                        MemoryPatcher.projectWorld(p, b, t.x, t.y, vw, vh)?.let { worldPoints.add(t to it) }
+                    }
                     origin = localPosition(p, b)?.let { pos ->
-                        cam?.let { c ->
-                            val sx = (view?.width ?: 1) / c.width
-                            val sy = (view?.height ?: 1) / c.height
-                            project(pos.first, pos.second, c, sx, sy, (view?.height ?: 1).toFloat())
-                        }
+                        MemoryPatcher.projectWorld(p, b, pos.first, pos.second, vw, vh)
                     }
                 }
                 view?.postInvalidate()
@@ -113,12 +116,8 @@ internal class EspOverlay(private val activity: MainActivity) {
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val c = cam ?: return
-            val sx = width / c.width
-            val sy = height / c.height
             val player = origin
-            for (t in targets) {
-                val p = project(t.x, t.y, c, sx, sy, height.toFloat())
+            for ((t, p) in worldPoints) {
                 if (p.first < -100f || p.first > width + 100f || p.second < -100f || p.second > height + 100f) continue
 
                 val color = when (t.kind) {
@@ -131,8 +130,8 @@ internal class EspOverlay(private val activity: MainActivity) {
 
                 if (boxes) {
                     boxPaint.color = color
-                    val w = 40f * sx
-                    val h = 70f * sy
+                    val w = 40f
+                    val h = 70f
                     canvas.drawRect(p.first - w / 2, p.second - h / 2, p.first + w / 2, p.second + h / 2, boxPaint)
                     dotPaint.color = color
                     canvas.drawCircle(p.first, p.second - h / 2 - 6f, 3f, dotPaint)
