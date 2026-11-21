@@ -323,7 +323,7 @@ internal object MemoryPatcher {
         writeBytes(pid, base + FIRE_ANGLE, original)
     }
 
-    /** Pure-memory terrain check: sample the tilemap along the segment. */
+    /** Pure-memory terrain check. The tile grid is read in ONE /proc/mem open per tick. */
     private fun castLos(pid: Int, base: Long, from: Pair<Double, Double>, to: EspTarget): Boolean {
         val mgr = readLong(pid, base + MAP_MANAGER_GLOBAL) ?: return true
         val layer = readLong(pid, mgr + 0x50) ?: return true
@@ -332,19 +332,21 @@ internal object MemoryPatcher {
         val mapH = readInt(pid, mgr + 0x9c) ?: return true
         val tw = readFloat(pid, layer + 0x148) ?: return true
         val th = readFloat(pid, layer + 0x14c) ?: return true
-        if (tw <= 0f || th <= 0f || mapW <= 0 || mapH <= 0) return true
+        if (tw <= 0f || th <= 0f || mapW <= 0 || mapH <= 0 || mapW > 1024 || mapH > 1024) return true
+
+        val grid = readBytes(pid, tiles, mapW * mapH * 4) ?: return true
+        val buf = ByteBuffer.wrap(grid).order(ByteOrder.LITTLE_ENDIAN)
 
         fun solid(x: Double, y: Double): Boolean {
             val tx = Math.floor(x / tw).toInt()
             val ty = Math.floor(y / th).toInt()
             if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) return false
-            val gid = readInt(pid, tiles + (tx + ty * mapW) * 4L) ?: return false
-            return gid > 0
+            return buf.getInt((tx + ty * mapW) * 4) > 0
         }
 
         val dx = to.x - from.first
         val dy = to.y - from.second
-        val steps = (hypot(dx, dy) / (tw / 2)).toInt().coerceAtMost(256)
+        val steps = (hypot(dx, dy) / tw).toInt().coerceIn(1, 64)
         for (i in 1 until steps) {
             val t = i.toDouble() / steps
             if (solid(from.first + dx * t, from.second + dy * t)) return false

@@ -282,7 +282,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
             panelParams.y = iconParams.y
             val dm = activity.resources.displayMetrics
             panelParams.width = (270 * dm.density).toInt()
-            panelParams.height = (dm.heightPixels - 140).coerceAtMost((620 * dm.density).toInt())
+            val wanted = (560 * dm.density).toInt()
+            panelParams.height = wanted.coerceAtMost(dm.heightPixels - 80)
+            panelParams.x = panelParams.x.coerceIn(0, (dm.widthPixels - panelParams.width - 8).coerceAtLeast(0))
+            panelParams.y = panelParams.y.coerceIn(0, (dm.heightPixels - panelParams.height - 8).coerceAtLeast(0))
             wm.addView(panel, panelParams)
             expanded = true
         } else {
