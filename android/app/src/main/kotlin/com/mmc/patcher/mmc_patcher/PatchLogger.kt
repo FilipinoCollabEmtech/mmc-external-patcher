@@ -60,7 +60,7 @@ internal object PatchLogger {
         sb.appendLine()
         val logcat = readLogcat().lines()
         val crashPattern = Regex(
-            """FATAL EXCEPTION|signal \d+|SIGSEGV|SIGABRT|SIGBUS|crash_dump|DEBUG|tombstone|ANR|Killed process|lowmemorykiller|MMCPatcher|cocos2d|libc|F DEBUG""",
+            """FATAL EXCEPTION|signal \d+|SIGSEGV|SIGABRT|SIGBUS|crash_dump|debuggerd|tombstone|backtrace|#\d\d pc|F libc|ANR|Killed process|lowmemorykiller|MMCPatcher""",
             RegexOption.IGNORE_CASE,
         )
         val highlights = logcat.filter { crashPattern.containsMatchIn(it) }.takeLast(80)

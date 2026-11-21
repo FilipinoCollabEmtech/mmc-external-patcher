@@ -403,6 +403,22 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
     // ---- toggle rows -----------------------------------------------------
 
+    /**
+     * The game can be relaunched while the panel is open (especially inside a
+     * virtual container), so cached pid/base go stale. Re-resolve before any
+     * memory write instead of trusting what was captured when the panel opened.
+     */
+    private fun ensureAttached(): Boolean {
+        MemoryPatcher.attach()?.let {
+            if (it.first != pid || it.second != base) {
+                PatchLogger.log("UI", "re-attached pid=${it.first} base=0x${it.second.toString(16)}")
+            }
+            pid = it.first
+            base = it.second
+        }
+        return pid != null && base != null
+    }
+
     private fun groupRow(
         key: String,
         glyph: String,
@@ -410,13 +426,11 @@ internal class FloatingMenu(private val activity: MainActivity) {
         subtitle: String,
         group: PatchGroup,
     ): View = toggleRow(key, glyph, label, subtitle) { checked ->
-        val p = pid
-        val b = base
-        if (p == null || b == null) {
+        if (!ensureAttached()) {
             toast("Launch MMC first")
             false
         } else {
-            applyGroup(p, b, group, checked)
+            applyGroup(pid!!, base!!, group, checked)
         }
     }
 
@@ -511,8 +525,12 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private fun setEsp(boxes: Boolean? = null, lines: Boolean? = null) {
         if (boxes != null) espBoxes = boxes
         if (lines != null) espLines = lines
-        val p = pid ?: return
-        val b = base ?: return
+        if (!ensureAttached()) {
+            toast("Launch MMC first")
+            return
+        }
+        val p = pid!!
+        val b = base!!
         if (espPid != p || espBase != b) {
             if (!MemoryPatcher.installInternalEsp(p, b)) {
                 PatchLogger.log("ESP", "install failed pid=$p base=0x${b.toString(16)}")
