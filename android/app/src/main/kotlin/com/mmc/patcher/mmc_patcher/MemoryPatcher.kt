@@ -48,13 +48,19 @@ internal object MemoryPatcher {
     private const val CAM_POINT_GLOBAL = 0x13c1008L
     private const val WORLD_LAYER_GLOBAL = 0x13be0ef8L
 
+    // Code cave + scratch (RX zero gap / RW .bss gap), from the RE dump.
+    private const val CAVE = 0xfbcac0L
+    private const val SCRATCH = 0x13f4000L
     private const val LOS_SLOT = 0x13f4700L
+    private const val LOS_ENABLE = 0x13f4704L
     private const val JOYPAD_SLOT = 0x13f4780L
-    private const val MAP_MANAGER_GLOBAL = 0x13be02c0L
+    private const val CAN_SEE_TARGET = 0x619e2cL
+    private const val FAKE_GETTER = 0xd97ee8L
     private const val FIRE_ANGLE = 0x6888f0L
 
-    // NOP; ADR x8,#12; LDR s0,[x8]; RET; <float>; NOP. No cave: BL clobbers LR and loops.
-    private val STUB_HEX = "1F2003D568000010000140BDC0035FD6000000001F2003D5"
+    // BL cave; RET. The cave restores x30 before returning.
+    private val STUB_HEX = "74D02494C0035FD6"
+    private val CAVE_HEX = "FFC300D1FD7B02A9F35301A9F3031EAAB4040058730214CBB00400581002138B000200F9900400581002138B10024039D0010034500400581002138B100240F9500100B4100240F9100100B4D00300581002138BE00310AAB10300583102138B20023FD60200001420008052500300581002138B00020039300300581002138B1112009160000034000240BD02000014200240BDF35341A9FD7B42A9FFC30091C0035FD6F48868000000000080473F010000000004473F0100000000F80D3C010000000000403F01000000002C9E61000000000000473F0100000000F888680000000000"
 
     private val originals = HashMap<Long, ByteArray>()
     private var comboThread: Thread? = null
@@ -65,6 +71,9 @@ internal object MemoryPatcher {
     @Volatile private var lastLosClear = false
     @Volatile private var lastAimDeg = 0f
     @Volatile private var fireLatched = false
+    @Volatile private var smoothedDeg = 0f
+    @Volatile private var lockedTargetKey = ""
+    @Volatile private var targetHold = 0
 
     fun findPid(): Int? {
         val procs = File("/proc").listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) }
@@ -306,43 +315,41 @@ internal object MemoryPatcher {
             val original = readBytes(pid, stubAddr, 24) ?: return false
             originals[stubAddr] = original
         }
-        return writeBytes(pid, stubAddr, hexToBytes(STUB_HEX))
+        if (!writeBytes(pid, base + CAVE, hexToBytes(CAVE_HEX))) return false
+        if (!writeBytes(pid, stubAddr, hexToBytes(STUB_HEX))) return false
+
+        // Synthetic Enemy: vptr -> fake vtable -> cpSegmentShapeGetA, plus sight range.
+        val s = base + SCRATCH
+        writeLong(pid, s, s + 0x200)
+        writeLong(pid, s + 0x200 + 0x358, base + FAKE_GETTER)
+        writeFloat(pid, s + 0x180, 100000f)
+        writeBytes(pid, base + LOS_ENABLE, byteArrayOf(0))
+        return true
     }
 
     private fun uninstallStub(pid: Int, base: Long) {
+        writeBytes(pid, base + LOS_ENABLE, byteArrayOf(0))
         val original = originals.remove(base + FIRE_ANGLE) ?: return
         writeBytes(pid, base + FIRE_ANGLE, original)
     }
 
-    /** Pure-memory terrain check. The tile grid is read in ONE /proc/mem open per tick. */
+    /**
+     * Exact terrain check: feed endpoints to the game's own Enemy::canSeeTarget
+     * (called by the cave on the game thread), then read the result byte.
+     */
     private fun castLos(pid: Int, base: Long, from: Pair<Double, Double>, to: EspTarget): Boolean {
-        val mgr = readLong(pid, base + MAP_MANAGER_GLOBAL) ?: return true
-        val layer = readLong(pid, mgr + 0x50) ?: return true
-        val tiles = readLong(pid, layer + 0x150) ?: return true
-        val mapW = readInt(pid, mgr + 0x98) ?: return true
-        val mapH = readInt(pid, mgr + 0x9c) ?: return true
-        val tw = readFloat(pid, layer + 0x148) ?: return true
-        val th = readFloat(pid, layer + 0x14c) ?: return true
-        if (tw <= 0f || th <= 0f || mapW <= 0 || mapH <= 0 || mapW > 1024 || mapH > 1024) return true
-
-        val grid = readBytes(pid, tiles, mapW * mapH * 4) ?: return true
-        val buf = ByteBuffer.wrap(grid).order(ByteOrder.LITTLE_ENDIAN)
-
-        fun solid(x: Double, y: Double): Boolean {
-            val tx = Math.floor(x / tw).toInt()
-            val ty = Math.floor(y / th).toInt()
-            if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) return false
-            return buf.getInt((tx + ty * mapW) * 4) > 0
+        val s = base + SCRATCH
+        fun pair(x: Double, y: Double) =
+            ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN).putDouble(x).putDouble(y).array()
+        writeBytes(pid, s + 0x80, pair(from.first, from.second))
+        writeBytes(pid, s + 0x160, pair(to.x, to.y))
+        writeBytes(pid, base + LOS_ENABLE, byteArrayOf(1))
+        try {
+            Thread.sleep(20)
+        } catch (_: InterruptedException) {
+            // Ignore.
         }
-
-        val dx = to.x - from.first
-        val dy = to.y - from.second
-        val steps = (hypot(dx, dy) / tw).toInt().coerceIn(1, 64)
-        for (i in 1 until steps) {
-            val t = i.toDouble() / steps
-            if (solid(from.first + dx * t, from.second + dy * t)) return false
-        }
-        return true
+        return readBytes(pid, base + LOS_SLOT, 1)?.firstOrNull() == 1.toByte()
     }
 
     private fun findJoypad(pid: Int, base: Long): Long? {
@@ -416,7 +423,8 @@ internal object MemoryPatcher {
                         readLong(p, it + 0x150)?.let { v -> readFloat(p, v + 0x2a0) }
                     } ?: live ?: 0f
 
-                    var target: EspTarget? = null
+                    // Nearest target with hysteresis: don't flip targets every tick.
+                    var nearest: EspTarget? = null
                     var best = 4000.0
                     val origin = localPosition(p, b)
                     if (origin != null) {
@@ -424,32 +432,48 @@ internal object MemoryPatcher {
                             val dist = hypot(t.x - origin.first, t.y - origin.second)
                             if (dist < 10.0 || dist >= best) continue
                             best = dist
-                            target = t
+                            nearest = t
                         }
                     }
+                    val key = nearest?.let { "${it.kind}:${it.x.toInt()}:${it.y.toInt()}" } ?: ""
+                    if (key == lockedTargetKey) targetHold++ else {
+                        lockedTargetKey = key
+                        targetHold = 1
+                    }
+                    val stable = if (targetHold >= 3) nearest else null
 
-                    if ((aimEnabled || triggerEnabled) && target != null && origin != null) {
-                        val deg = normalizeDeg((atan2(-(target!!.y - origin.second), target!!.x - origin.first) * 180.0 / Math.PI).toFloat())
+                    val native = live ?: baseAngle
+                    if ((aimEnabled || triggerEnabled) && stable != null && origin != null) {
+                        val deg = normalizeDeg((atan2(-(stable.y - origin.second), stable.x - origin.first) * 180.0 / Math.PI).toFloat())
                         lastAimDeg = deg
                         if (aimEnabled) {
+                            // Ease toward the target angle so the view doesn't snap/flicker.
+                            var delta = normalizeDeg(deg - smoothedDeg)
+                            if (delta > 180f) delta -= 360f
+                            smoothedDeg = normalizeDeg(smoothedDeg + delta.coerceIn(-14f, 14f))
                             zeroSway(p, lc!!)
-                            writeFloat(p, stub + 16, deg)
                         } else {
-                            writeFloat(p, stub + 16, live ?: baseAngle)
+                            smoothedDeg = native
                         }
-                        val aligned = !triggerEnabled || aimEnabled || angleDiff(deg, live ?: deg) < 12f
+                        // stub+8 = clear angle, stub+12 = blocked/native angle.
+                        writeFloat(p, stub + 8, smoothedDeg)
+                        writeFloat(p, stub + 12, native)
+                        val aligned = !triggerEnabled || aimEnabled || angleDiff(deg, native) < 12f
                         if (aligned) {
-                            selectedTarget = target
-                            lastLosClear = castLos(p, b, origin, target!!)
+                            selectedTarget = stable
+                            lastLosClear = castLos(p, b, origin, stable)
                         } else {
                             selectedTarget = null
                             lastLosClear = false
+                            writeBytes(p, b + LOS_ENABLE, byteArrayOf(0))
                         }
-                        writeBytes(p, b + LOS_SLOT, byteArrayOf(if (lastLosClear) 1 else 0))
                     } else {
                         selectedTarget = null
                         lastLosClear = false
-                        writeFloat(p, stub + 16, live ?: baseAngle)
+                        smoothedDeg = native
+                        writeBytes(p, b + LOS_ENABLE, byteArrayOf(0))
+                        writeFloat(p, stub + 8, native)
+                        writeFloat(p, stub + 12, native)
                     }
 
                     val shouldFire = triggerEnabled && joypad != null && selectedTarget != null && lastLosClear
