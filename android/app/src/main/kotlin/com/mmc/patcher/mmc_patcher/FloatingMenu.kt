@@ -16,7 +16,8 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.applyGroup
-import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleAimlock
+import com.mmc.patcher.mmc_patcher.MemoryPatcher.setAimlock
+import com.mmc.patcher.mmc_patcher.MemoryPatcher.setTriggerbot
 
 /** Floating icon + toggle panel, mirroring the ALP/ChoRok injector overlay. */
 internal class FloatingMenu(private val activity: MainActivity) {
@@ -70,6 +71,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
         esp = null
         debug?.hide()
         debug = null
+        MemoryPatcher.setAimlock(false)
+        MemoryPatcher.setTriggerbot(false)
     }
 
     private fun rounded(color: Int, radius: Float): GradientDrawable = GradientDrawable().apply {
@@ -186,7 +189,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
             isChecked = false
         }
         aimSwitch.setOnCheckedChangeListener { _, checked ->
-            val ok = toggleAimlock(checked)
+            val ok = MemoryPatcher.setAimlock(checked)
             if (!ok) {
                 aimSwitch.isChecked = false
                 toast("Aimlock failed - launch MMC first")
@@ -195,6 +198,24 @@ internal class FloatingMenu(private val activity: MainActivity) {
             }
         }
         container.addView(aimSwitch)
+
+        val triggerSwitch = Switch(activity).apply {
+            text = "Triggerbot (LOS gated)"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(6, 4, 0, 10)
+            isChecked = false
+        }
+        triggerSwitch.setOnCheckedChangeListener { _, checked ->
+            val ok = MemoryPatcher.setTriggerbot(checked)
+            if (!ok) {
+                triggerSwitch.isChecked = false
+                toast("Triggerbot failed - launch MMC first")
+            } else {
+                toast("Triggerbot: ${if (checked) "ON" else "OFF"}")
+            }
+        }
+        container.addView(triggerSwitch)
 
         container.addView(sectionLabel("ESP"))
         for ((label, isBoxes) in listOf("Boxes" to true, "Lines" to false)) {
