@@ -12,7 +12,11 @@ class PatcherApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MMC Patcher',
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.red),
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: Colors.red,
+      ),
       home: const PatcherHome(),
     );
   }

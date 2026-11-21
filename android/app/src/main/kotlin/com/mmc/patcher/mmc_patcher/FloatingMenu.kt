@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.view.Gravity
@@ -14,8 +15,10 @@ import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import com.mmc.patcher.mmc_patcher.MemoryPatcher.applyGroup
+import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleAimlock
 
-/** Floating icon + expanded toggle panel, mirroring the ALP injector's overlay. */
+/** Floating icon + toggle panel, mirroring the ALP/ChoRok injector overlay. */
 internal class FloatingMenu(private val activity: MainActivity) {
     private val wm = activity.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var icon: View? = null
@@ -23,6 +26,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var expanded = false
     private var pid: Int? = null
     private var base: Long? = null
+
+    private val accent = Color.rgb(255, 82, 82)
+    private val panelBg = Color.rgb(16, 16, 20)
+    private val textDim = Color.rgb(160, 160, 172)
 
     private fun overlayParams(): WindowManager.LayoutParams {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -37,15 +44,14 @@ internal class FloatingMenu(private val activity: MainActivity) {
             PixelFormat.RGBA_8888,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 48
-            y = 220
+            x = 40
+            y = 200
         }
     }
 
     private var iconParams = overlayParams()
     private var panelParams = overlayParams()
 
-    @SuppressLint("SetTextI18n")
     fun show() {
         if (icon != null) return
         icon = buildIcon()
@@ -67,65 +73,59 @@ internal class FloatingMenu(private val activity: MainActivity) {
     }
 
     @SuppressLint("SetTextI18n")
-    private fun buildIcon(): TextView {
-        val label = TextView(activity).apply {
-            text = "MMC"
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            gravity = Gravity.CENTER
-            background = rounded(Color.rgb(28, 28, 32), 28f)
-            setPadding(18, 18, 18, 18)
-        }
-        makeDraggable(label, { iconParams }, { iconParams = it })
-        label.setOnClickListener { togglePanel() }
-        return label
+    private fun buildIcon(): TextView = TextView(activity).apply {
+        text = "MMC"
+        setTextColor(Color.WHITE)
+        textSize = 14f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        background = rounded(accent, 28f)
+        setPadding(20, 20, 20, 20)
+        makeDraggable(this, { iconParams }, { iconParams = it })
+        setOnClickListener { togglePanel() }
     }
 
     @SuppressLint("SetTextI18n")
     private fun buildPanel(): LinearLayout {
         val container = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            background = rounded(Color.rgb(18, 18, 22), 16f)
-            setPadding(26, 20, 26, 20)
+            background = rounded(panelBg, 18f)
+            setPadding(30, 22, 30, 22)
         }
 
         val title = TextView(activity).apply {
-            text = "MMC PATCHER"
-            setTextColor(Color.rgb(255, 82, 82))
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.BOLD)
+            text = "MMC  PATCHER"
+            setTextColor(accent)
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
+            letterSpacing = 0.08f
         }
         container.addView(title)
-
-        val status = TextView(activity).apply {
-            text = "attached: no"
-            setTextColor(Color.rgb(170, 170, 180))
-            textSize = 11f
-            gravity = Gravity.CENTER
-            setPadding(0, 4, 0, 12)
-        }
-        container.addView(status)
 
         if (pid == null || base == null) {
             val attached = MemoryPatcher.attach()
             if (attached != null) {
                 pid = attached.first
                 base = attached.second
-                status.text = "pid=$pid  base=0x${base?.toString(16)}"
-            } else {
-                status.text = "game not running - launch MMC first"
             }
-        } else {
-            status.text = "pid=$pid  base=0x${base?.toString(16)}"
         }
+        val status = TextView(activity).apply {
+            text = if (pid != null) "pid=$pid   base=0x${base?.toString(16)}" else "game not running - launch MMC"
+            setTextColor(textDim)
+            textSize = 10f
+            gravity = Gravity.CENTER
+            setPadding(0, 4, 0, 14)
+        }
+        container.addView(status)
 
-        for (patch in PATCHES) {
+        for (group in PATCH_GROUPS) {
+            container.addView(sectionLabel(group.name))
             val sw = Switch(activity).apply {
-                text = patch.name
+                text = "Enable"
                 setTextColor(Color.WHITE)
                 textSize = 13f
-                setPadding(0, 6, 0, 6)
+                setPadding(6, 4, 0, 10)
                 isChecked = false
             }
             sw.setOnCheckedChangeListener { _, checked ->
@@ -133,32 +133,63 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 val b = base
                 if (p == null || b == null) {
                     sw.isChecked = false
-                    Toast.makeText(activity, "Attach failed - launch MMC first", Toast.LENGTH_SHORT).show()
+                    toast("Launch MMC first")
                     return@setOnCheckedChangeListener
                 }
-                val ok = MemoryPatcher.applyPatch(p, b, patch, checked)
+                val ok = applyGroup(p, b, group, checked)
                 if (!ok) {
                     sw.isChecked = false
-                    Toast.makeText(activity, "Patch failed: ${patch.name}", Toast.LENGTH_SHORT).show()
+                    toast("Failed: ${group.name}")
                 } else {
-                    Toast.makeText(activity, "${patch.name}: ${if (checked) "ON" else "OFF"}", Toast.LENGTH_SHORT).show()
+                    toast("${group.name}: ${if (checked) "ON" else "OFF"}")
                 }
             }
             container.addView(sw)
         }
 
+        container.addView(sectionLabel("AIM"))
+        val aimSwitch = Switch(activity).apply {
+            text = "Aimlock (nearest enemy)"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(6, 4, 0, 10)
+            isChecked = false
+        }
+        aimSwitch.setOnCheckedChangeListener { _, checked ->
+            val ok = toggleAimlock(checked)
+            if (!ok) {
+                aimSwitch.isChecked = false
+                toast("Aimlock failed - launch MMC first")
+            } else {
+                toast("Aimlock: ${if (checked) "ON" else "OFF"}")
+            }
+        }
+        container.addView(aimSwitch)
+
         val minimize = TextView(activity).apply {
-            text = "— MINIMIZE —"
+            text = "—  MINIMIZE  —"
             setTextColor(Color.rgb(140, 190, 255))
             textSize = 12f
             gravity = Gravity.CENTER
-            setPadding(0, 14, 0, 0)
+            setPadding(0, 12, 0, 0)
             setOnClickListener { togglePanel() }
         }
         container.addView(minimize)
 
         makeDraggable(container, { panelParams }, { panelParams = it })
         return container
+    }
+
+    private fun sectionLabel(text: String): TextView = TextView(activity).apply {
+        this.text = text
+        setTextColor(Color.rgb(255, 170, 80))
+        textSize = 11f
+        typeface = Typeface.DEFAULT_BOLD
+        setPadding(0, 8, 0, 0)
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
     }
 
     private fun togglePanel() {
