@@ -56,6 +56,7 @@ internal object MemoryPatcher {
     // LOS probe: runs inside the aimlock getter and calls the game's segment query.
     private const val LOS_CODE_OFFSET = 0x500c00L
     private const val LOS_DATA_OFFSET = 0x500e00L
+    private const val LOS_BRANCH_HEX = "C4E0F917"  // b 0x500c00 from 0x6888f0
     private const val LOS_ENGINE_HEX =
         "ffc300d1e00300f9fe1700f9f3d300a9f55b01a9f7e301a9530f0010782a40f9e00313aa00cc7492010084d2e20080d200033fd6740240b9d4030034601240bd0020201e66030054740640f915bf81d29527a0f2956a75f8d50200b4b50240f9950200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9a00000b534008052740600b9601240bd0500001414008052740600b9f70340f9e08241bdf7e341a9f55b41a9f3d340a9fe1740f9ffc30091c0035fd6"
 
@@ -429,6 +430,11 @@ internal object MemoryPatcher {
             // NaN in the literal slot means "no target" -> native joystick angle.
             val patch = hexToBytes("008041BD8100001C2020211E207C201EC0035FD60000C07F")
             if (!writeBytes(pid, address, patch)) return false
+            // Enabling aimlock after LOS must not clobber the probe's branch.
+            if (losActive) {
+                losSaved[address] = patch
+                if (!writeBytes(pid, address, hexToBytes(LOS_BRANCH_HEX))) return false
+            }
 
             aimRunning = true
             aimThread = Thread {
@@ -557,7 +563,7 @@ internal object MemoryPatcher {
             PatchLogger.log("LOS", "LOS cave not empty")
             return false
         }
-        val stub = hexToBytes("C4E0F917")  // b 0x500c00 from 0x6888f0
+        val stub = hexToBytes(LOS_BRANCH_HEX)
         val prev = readBytes(pid, address, 24) ?: return false
         val data = ByteBuffer.allocate(0xa0).order(ByteOrder.LITTLE_ENDIAN)
         data.putInt(1)                       // flags: enabled
