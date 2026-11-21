@@ -44,6 +44,8 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += listOf("-DANDROID_STL=c++_static")
+                // CMake's ptrace code is arm64-only; do not compile other ABIs.
+                abiFilters += listOf("arm64-v8a")
             }
         }
     }
