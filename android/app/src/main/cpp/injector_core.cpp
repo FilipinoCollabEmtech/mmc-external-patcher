@@ -81,6 +81,27 @@ static bool read_word(pid_t pid, uintptr_t addr, uint64_t *out) {
     return true;
 }
 
+/* Reads a NUL-terminated string out of the target for dlerror() diagnostics. */
+static void log_remote_string(pid_t pid, uintptr_t addr, const char *label) {
+    if (!addr) { LOGE("%s: null", label); return; }
+    char buf[512];
+    size_t n = 0;
+    uintptr_t base = addr & ~static_cast<uintptr_t>(7);
+    size_t skip = addr - base;
+    for (size_t off = 0; n < sizeof(buf) - 1; off += 8) {
+        uint64_t word = 0;
+        if (!read_word(pid, base + off, &word)) break;
+        for (size_t i = skip; i < 8 && n < sizeof(buf) - 1; ++i) {
+            char c = static_cast<char>((word >> (i * 8)) & 0xff);
+            if (!c) { buf[n] = 0; LOGE("%s: %s", label, buf); return; }
+            buf[n++] = c;
+        }
+        skip = 0;
+    }
+    buf[n] = 0;
+    LOGE("%s: %s", label, buf);
+}
+
 /* All callers write 8-byte-aligned, 8-byte-multiple buffers. */
 static bool write_mem(pid_t pid, uintptr_t addr, const void *buf, size_t len) {
     if ((addr & 7) || (len & 7)) return false;
@@ -169,16 +190,19 @@ int injector_inject(pid_t pid, const char *path) {
     /* Compute remote addresses of mmap/dlopen from the local libc layout. */
     void *local_mmap = dlsym(RTLD_DEFAULT, "mmap");
     void *local_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
-    Dl_info mmap_info, dlopen_info;
-    if (!local_mmap || !local_dlopen ||
+    void *local_dlerror = dlsym(RTLD_DEFAULT, "dlerror");
+    Dl_info mmap_info, dlopen_info, dlerror_info;
+    if (!local_mmap || !local_dlopen || !local_dlerror ||
         dladdr(local_mmap, &mmap_info) == 0 ||
-        dladdr(local_dlopen, &dlopen_info) == 0) {
-        LOGE("cannot resolve local mmap/dlopen offsets");
+        dladdr(local_dlopen, &dlopen_info) == 0 ||
+        dladdr(local_dlerror, &dlerror_info) == 0) {
+        LOGE("cannot resolve local mmap/dlopen/dlerror offsets");
         ptrace(PTRACE_DETACH, pid, 0, 0);
         return INJECT_ERR_SYMBOLS;
     }
     uintptr_t mmap_off = (uintptr_t)local_mmap - (uintptr_t)mmap_info.dli_fbase;
     uintptr_t dlopen_off = (uintptr_t)local_dlopen - (uintptr_t)dlopen_info.dli_fbase;
+    uintptr_t dlerror_off = (uintptr_t)local_dlerror - (uintptr_t)dlerror_info.dli_fbase;
     uintptr_t target_libc = find_lib_base(pid, "/libc.so", false);
     if (!target_libc) {
         LOGE("cannot find libc.so in target maps");
@@ -187,10 +211,12 @@ int injector_inject(pid_t pid, const char *path) {
     }
     uintptr_t remote_mmap = target_libc + mmap_off;
     uintptr_t remote_dlopen = target_libc + dlopen_off;
-    LOGI("target libc=0x%llx mmap=0x%llx dlopen=0x%llx",
+    uintptr_t remote_dlerror = target_libc + dlerror_off;
+    LOGI("target libc=0x%llx mmap=0x%llx dlopen=0x%llx dlerror=0x%llx",
          (unsigned long long)target_libc,
          (unsigned long long)remote_mmap,
-         (unsigned long long)remote_dlopen);
+         (unsigned long long)remote_dlopen,
+         (unsigned long long)remote_dlerror);
 
     int rc = INJECT_OK;
 
@@ -288,7 +314,18 @@ int injector_inject(pid_t pid, const char *path) {
         uint64_t handle = 0;
         if (read_word(pid, rwx + 0x48, &handle)) {
             LOGI("dlopen handle=0x%llx", (unsigned long long)handle);
-            if (!handle) rc = INJECT_ERR_DLOPEN_NULL;
+            if (!handle) {
+                /* Ask the target for dlerror() so we know WHY the load failed. */
+                struct user_regs_struct er = saved;
+                er.pc = remote_dlerror;
+                er.regs[30] = rwx + kTrapOff;
+                er.sp = rwx + kRegionSize;
+                if (set_regs(pid, &er) && wait_stop(pid, 5000)) {
+                    struct user_regs_struct after;
+                    if (get_regs(pid, &after)) log_remote_string(pid, after.regs[0], "dlerror");
+                }
+                rc = INJECT_ERR_DLOPEN_NULL;
+            }
         } else {
             LOGE("cannot read dlopen result slot");
             rc = INJECT_ERR_DLOPEN_CALL;

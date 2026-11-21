@@ -198,27 +198,50 @@ internal object NativeInjector {
         }
     }
 
-    /** Try our own path, then the game's virtual data dir; root staging is last. */
+    /** Try every candidate in one run and report which one works. */
     private fun loadSo(pid: Int, local: String, destName: String): InjectResult {
-        val attempts = mutableListOf<String>()
-        var result = inject(pid, local)
-        if (result.ok) return result
-        attempts += "own path: ${result.detail}"
+        val attempts = mutableListOf<Pair<String, InjectResult>>()
+        fun tryPath(name: String, path: String): InjectResult? {
+            val result = inject(pid, path)
+            PatchLogger.log(TAG, "ATTEMPT $name -> ${if (result.ok) "OK" else result.detail}")
+            attempts += name to result
+            return if (result.ok) result else null
+        }
+        fun finish(name: String, result: InjectResult): InjectResult {
+            PatchLogger.log(TAG, "WORKING=$name")
+            return result
+        }
+
+        tryPath("own", local)?.let { return finish("own", it) }
 
         val vaPath = stageViaVirtualApp(local, destName)
         if (vaPath != null) {
-            result = inject(pid, vaPath)
-            if (result.ok) return result
-            attempts += "VA path: ${result.detail}"
+            tryPath("va_game_data", vaPath)?.let { return finish("va_game_data", it) }
+        }
+
+        // Direct write to /data/local/tmp without root; may be denied by SELinux.
+        val tmpPath = "/data/local/tmp/$destName"
+        val tmpWritten = try {
+            File(tmpPath).let {
+                File(local).copyTo(it, overwrite = true)
+                it.setReadable(true, false)
+                true
+            }
+        } catch (e: Exception) {
+            PatchLogger.log(TAG, "tmp write failed: ${e.message}")
+            false
+        }
+        if (tmpWritten) {
+            tryPath("data_local_tmp", tmpPath)?.let { return finish("data_local_tmp", it) }
         }
 
         val staged = stageIntoGame(pid, local, destName)
-        if (staged != null && staged != local && staged != vaPath) {
-            result = inject(pid, staged)
-            if (result.ok) return result
-            attempts += "root path: ${result.detail}"
+        if (staged != null && staged != local && staged != vaPath && staged != tmpPath) {
+            tryPath("root_stage", staged)?.let { return finish("root_stage", it) }
         }
-        return InjectResult(false, attempts.joinToString("; "))
+
+        PatchLogger.log(TAG, "WORKING=none; attempts=" + attempts.joinToString { "${it.first}:${it.second.detail}" })
+        return InjectResult(false, attempts.joinToString("; ") { "${it.first}: ${it.second.detail}" })
     }
 
     fun loadLgl(context: Context): InjectResult {
