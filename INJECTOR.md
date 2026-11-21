@@ -1,5 +1,19 @@
 # Runtime injector (branch `feat/runtime-injector`)
 
+> **UNCONTINUABLE — 2026-11-21.** On the target device (vivo V1818A, Android
+> 8.1, VirtualApp-hosted game), every load path was tried in one build:
+> own `filesDir`, game's VirtualApp data dir, `/data/local/tmp`, root staging,
+> and a path-less `memfd_create` + `dlopen("/proc/self/fd/N")` using bytes
+> written directly into the game. `memfd fd=175` was created and the ELF was
+> written successfully, but `dlopen` still returned `handle=0x0`; path-based
+> attempts returned the same. `dlerror()` probes time out. `su` is unavailable,
+> so no privileged CLI or filesystem staging. Attach, `PTRACE_GETREGSET`,
+> remote `mmap`, and the `dlopen` call itself all work (same UID 10553), so the
+> blocker is the game process's linker/SELinux policy on loading arbitrary
+> libraries — not our payload. Full LGL capability is not reachable this way
+> without root/zygote-level injection or repacking. Do not spend further builds
+> here; the byte-patcher on `main` is the viable architecture.
+
 Loads the existing LGL mod (`libMyLibName.so`) into the **unmodified** Mini
 Militia Classic process (`com.appsomniacs.mmc`, ARM64) at runtime with
 `dlopen()` under root/ptrace. No APK repacking, no re-signing, original game
