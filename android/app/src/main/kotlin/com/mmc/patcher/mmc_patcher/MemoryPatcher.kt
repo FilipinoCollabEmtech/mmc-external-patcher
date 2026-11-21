@@ -57,7 +57,7 @@ internal object MemoryPatcher {
     private const val LOS_CODE_OFFSET = 0x500c00L
     private const val LOS_DATA_OFFSET = 0x500e00L
     private const val LOS_ENGINE_HEX =
-        "ff8300d1e00300f9fe0700f9f35301a9930f0010782a40f9e00313aa00cc7492010084d2e20080d200033fd6740240b9d4030034601240bd0020201e66030054740640f915bf81d29527a0f2956a75f8d50200b4b50200b4b50240f9750200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9800000b534008052740600b90500001414008052740600b9f70340f9e08241bdf35341a9fe0740f9ff830091c0035fd6"
+        "ffc300d1e00300f9fe1700f9f3d300a9f55b01a9f7e301a9530f0010782a40f9e00313aa00cc7492010084d2e20080d200033fd6740240b9d4030034601240bd0020201e66030054740640f915bf81d29527a0f2956a75f8d50200b4b50240f9950200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9a00000b534008052740600b9601240bd0500001414008052740600b9f70340f9e08241bdf7e341a9f55b41a9f3d340a9fe1740f9ffc30091c0035fd6"
 
     @Volatile private var losActive = false
     @Volatile private var losOrigin = Pair(0.0, 0.0)
@@ -588,19 +588,16 @@ internal object MemoryPatcher {
     fun writeLosFrame(pid: Int, base: Long, angle: Float) {
         if (!losActive) return
         val d = base + LOS_DATA_OFFSET
-        val b = ByteBuffer.allocate(0x50).order(ByteOrder.LITTLE_ENDIAN)
-        b.putInt(1)                 // keep LOS enabled
-        b.putInt(0)                 // visible set by engine
-        b.putLong(base)
-        b.putFloat(angle)
-        b.putFloat(0f)
-        b.putLong(0)                // align to 0x20
-        b.putDouble(losOrigin.first)
-        b.putDouble(losOrigin.second)
-        b.putDouble(losTarget.first)
-        b.putDouble(losTarget.second)
-        b.putLong(0)
-        b.putLong(0)
+        // Absolute puts: never touch engine-owned slots (+0x04 visible,
+        // +0x40 space, +0x48 result) that the cave writes each frame.
+        val b = ByteBuffer.allocate(0x40).order(ByteOrder.LITTLE_ENDIAN)
+        b.putInt(0x00, 1)                    // flags
+        b.putLong(0x08, base)
+        b.putFloat(0x10, angle)
+        b.putDouble(0x20, losOrigin.first)
+        b.putDouble(0x28, losOrigin.second)
+        b.putDouble(0x30, losTarget.first)
+        b.putDouble(0x38, losTarget.second)
         writeBytes(pid, d, b.array())
     }
 
