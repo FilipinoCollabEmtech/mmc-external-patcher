@@ -58,7 +58,9 @@ internal object PatchLogger {
         sb.appendLine("--- app events ---")
         synchronized(events) { events.forEach { sb.appendLine(it) } }
         sb.appendLine()
-        val logcat = readLogcat().lines()
+        val logcat = readLogcat().lines().filter {
+            !it.contains("avc: denied") && !it.contains("type=1400 audit")
+        }
         val crashBuffer = runCommand(arrayOf("su", "-c", "logcat -b crash -d -t 200"))
         val tombstone = runCommand(
             arrayOf("su", "-c", "f=\$(ls -t /data/tombstones/tombstone_* 2>/dev/null | head -1); [ -n \"\$f\" ] && head -120 \"\$f\""),

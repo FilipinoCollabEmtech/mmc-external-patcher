@@ -57,7 +57,7 @@ internal object MemoryPatcher {
     private const val LOS_CODE_OFFSET = 0x500c00L
     private const val LOS_DATA_OFFSET = 0x500e00L
     private const val LOS_ENGINE_HEX =
-        "ff8300d1e00300f9fe0700f9f35301a9930f0010740240b9b4030034601240bd0020201e46030054740640f915bf81d21578a2f2956a75f8b50200b4b50240f9750200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9800000b534008052740600b90500001414008052740600b9f70340f9e08241bdf35341a9fe0740f9ff830091c0035fd6"
+        "ff8300d1e00300f9fe0700f9f35301a9930f0010782a40f9e00313aa00cc7492010084d2e20080d200033fd6740240b9b4030034601240bd0020201e46030054740640f915bf81d21578a2f2956a75f8b50200b4b50240f9750200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9800000b534008052740600b90500001414008052740600b9f70340f9e08241bdf35341a9fe0740f9ff830091c0035fd6"
 
     @Volatile private var losActive = false
     @Volatile private var losOrigin = Pair(0.0, 0.0)
@@ -565,12 +565,15 @@ internal object MemoryPatcher {
         data.putLong(base)                   // base
         data.putFloat(Float.NaN)             // angle (NaN = no target)
         data.putFloat(0f)                    // pad
+        data.putLong(0)                      // align to 0x20
         data.putDouble(losOrigin.first)
         data.putDouble(losOrigin.second)
         data.putDouble(losTarget.first)
         data.putDouble(losTarget.second)
         data.putLong(0)                      // space debug
         data.putLong(0)                      // query result debug
+        data.putLong(base + MPROTECT_OFFSET) // mprotect PLT for the cave
+        repeat(5) { data.putLong(0) }        // pad to 0x80
         repeat(4) { data.putLong(0) }        // 32-byte zeroed query info
         if (!writeBytes(pid, base + LOS_DATA_OFFSET, data.array())) return false
         if (!writeBytes(pid, base + LOS_CODE_OFFSET, hexToBytes(LOS_ENGINE_HEX))) return false
@@ -591,6 +594,7 @@ internal object MemoryPatcher {
         b.putLong(base)
         b.putFloat(angle)
         b.putFloat(0f)
+        b.putLong(0)                // align to 0x20
         b.putDouble(losOrigin.first)
         b.putDouble(losOrigin.second)
         b.putDouble(losTarget.first)
