@@ -20,7 +20,6 @@ internal const val KIND_LOCAL = 6
 internal data class EspTarget(val x: Double, val y: Double, val kind: Int, val hp: Float)
 internal data class Camera(val x: Float, val y: Float, val width: Float, val height: Float)
 
-/** ARM64 byte patches from lgl_project/jni/Main.cpp, targeting libcocos2dcpp.so. */
 internal val PATCH_GROUPS = listOf(
     PatchGroup("God Mode", listOf(
         Patch("Humanoid damage", 0x67cffcL, "C0 03 5F D6"),
@@ -44,18 +43,9 @@ internal object MemoryPatcher {
 
     private const val FIRE_ANGLE_OFFSET = 0x6888f0L
     private const val LOCAL_CONTROLLER_GLOBAL = 0x13bec80L
+    private const val REMOTE_PLAYERS_GLOBAL = 0x13bf260L
+    private const val ALL_DRONES_GLOBAL = 0x13be0a0L
     private const val DIRECTOR_GLOBAL = 0x13ec228L
-
-    // VTable addresses from dynsyms; object vptr = vtable + 0x10.
-    private val ENTITY_VTABLES = mapOf(
-        0x1334610L + 0x10 to KIND_DRONE,      // HumanoidDrone
-        0x13337f0L + 0x10 to KIND_HAWK,       // HawkDrone
-        0x135a960L + 0x10 to KIND_WORM,       // WormDrone
-        0x1352120L + 0x10 to KIND_AI,         // SoldierAIController
-        0x1353580L + 0x10 to KIND_PLAYER,     // SoldierRemoteController
-        0x1352df0L + 0x10 to KIND_LOCAL,      // SoldierLocalController
-        0x132d1c0L + 0x10 to KIND_DRONE,      // Enemy
-    )
 
     private val originals = HashMap<Long, ByteArray>()
     private var aimThread: Thread? = null
@@ -128,24 +118,16 @@ internal object MemoryPatcher {
     }
 
     private fun readLong(pid: Int, address: Long): Long? =
-        readBytes(pid, address, 8)?.let {
-            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).long
-        }
+        readBytes(pid, address, 8)?.let { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).long }
 
     private fun readInt(pid: Int, address: Long): Int? =
-        readBytes(pid, address, 4)?.let {
-            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).int
-        }
+        readBytes(pid, address, 4)?.let { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).int }
 
     private fun readFloat(pid: Int, address: Long): Float? =
-        readBytes(pid, address, 4)?.let {
-            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).float
-        }
+        readBytes(pid, address, 4)?.let { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).float }
 
     private fun readDouble(pid: Int, address: Long): Double? =
-        readBytes(pid, address, 8)?.let {
-            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).double
-        }
+        readBytes(pid, address, 8)?.let { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).double }
 
     private fun writeBytes(pid: Int, address: Long, bytes: ByteArray): Boolean {
         val mem = openMem(pid, "rw") ?: return writeViaShell(pid, address, bytes)
@@ -190,7 +172,107 @@ internal object MemoryPatcher {
         return allOk
     }
 
-    // ---- scene graph traversal (cocos2d CCNode/CCArray layouts from disassembly) ----
+    // ---- dictionary walking (both globals need TWO pointer reads) ----
+
+    private fun dictionaryObjects(pid: Int, holderGlobal: Long): List<Long> {
+        val holder = readLong(pid, holderGlobal) ?: return emptyList()
+        if (holder == 0L) return emptyList()
+        val dict = readLong(pid, holder) ?: return emptyList()
+        if (dict == 0L) return emptyList()
+        var elem = readLong(pid, dict + 0x18) ?: return emptyList()
+        val out = mutableListOf<Long>()
+        var guard = 0
+        while (elem != 0L && guard++ < 256) {
+            readLong(pid, elem + 0x108)?.let { if (it != 0L) out.add(it) }
+            elem = readLong(pid, elem + 0x120) ?: 0L
+        }
+        return out
+    }
+
+    /** SoldierController / SoldierLocalController: body at +0x1a8, x/y doubles at +0x30/+0x38. */
+    private fun soldierPosition(pid: Int, ctrl: Long): Pair<Double, Double>? {
+        val body = readLong(pid, ctrl + 0x1a8) ?: return null
+        if (body == 0L) return null
+        val x = readDouble(pid, body + 0x30) ?: return null
+        val y = readDouble(pid, body + 0x38) ?: return null
+        return x to y
+    }
+
+    /** Drones have a per-type indirection before the shared soldier body. */
+    private fun dronePosition(pid: Int, base: Long, obj: Long): Pair<Double, Double>? {
+        val vptr = readLong(pid, obj) ?: 0L
+        val offset = when (vptr - base) {
+            0x1334610L + 0x10, 0x132d1c0L + 0x10 -> 0x200L // HumanoidDrone / Enemy
+            0x13337f0L + 0x10 -> 0x230L                       // HawkDrone
+            0x135a960L + 0x10 -> 0x228L                       // WormDrone
+            else -> null
+        }
+        val candidates = if (offset != null) listOf(offset) else listOf(0x200L, 0x230L, 0x228L)
+        for (off in candidates) {
+            val holder = readLong(pid, obj + off) ?: continue
+            if (holder == 0L) continue
+            val pos = soldierPosition(pid, holder) ?: continue
+            if (kotlin.math.abs(pos.first) < 20000 && kotlin.math.abs(pos.second) < 20000) return pos
+        }
+        return null
+    }
+
+    fun localController(pid: Int): Long? =
+        readLong(pid, LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
+
+    fun localPosition(pid: Int): Pair<Double, Double>? {
+        val lc = localController(pid) ?: return null
+        return soldierPosition(pid, lc)
+    }
+
+    fun collectTargets(pid: Int, base: Long): List<EspTarget> {
+        val out = mutableListOf<EspTarget>()
+        val seen = HashSet<Long>()
+
+        // Campaign robots: all-drones dictionary at *(*(base+0x13be0a0))
+        for (obj in dictionaryObjects(pid, ALL_DRONES_GLOBAL)) {
+            if (!seen.add(obj)) continue
+            val pos = dronePosition(pid, base, obj) ?: continue
+            val kind = when (readLong(pid, obj)?.minus(base)) {
+                0x13337f0L + 0x10 -> KIND_HAWK
+                0x135a960L + 0x10 -> KIND_WORM
+                else -> KIND_DRONE
+            }
+            out.add(EspTarget(pos.first, pos.second, kind, 0f))
+        }
+
+        // Multiplayer / LAN players: *(*(base+0x13bf260))
+        for (ctrl in dictionaryObjects(pid, REMOTE_PLAYERS_GLOBAL)) {
+            if (!seen.add(ctrl)) continue
+            val pos = soldierPosition(pid, ctrl) ?: continue
+            out.add(EspTarget(pos.first, pos.second, KIND_PLAYER, 0f))
+        }
+        return out
+    }
+
+    // ---- ESP camera ----
+
+    fun camera(pid: Int, base: Long): Camera? {
+        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
+        val width = readFloat(pid, director + 0xd0) ?: return null
+        val height = readFloat(pid, director + 0xd4) ?: return null
+        val scene = readLong(pid, director + 0xa0) ?: return null
+        var best = -1f
+        var camX = 0f
+        var camY = 0f
+        for (c1 in children(pid, scene)) {
+            val p1 = readPoint(pid, c1) ?: continue
+            for (c2 in children(pid, c1)) {
+                val p2 = readPoint(pid, c2) ?: continue
+                val mag = kotlin.math.abs(p2.first) + kotlin.math.abs(p2.second)
+                if (mag < 100f || mag > 8000f || mag <= best) continue
+                best = mag
+                camX = p1.first + p2.first
+                camY = p1.second + p2.second
+            }
+        }
+        return Camera(camX, camY, width, height)
+    }
 
     private fun children(pid: Int, node: Long): List<Long> {
         val arr = readLong(pid, node + 0xb8) ?: return emptyList()
@@ -216,91 +298,41 @@ internal object MemoryPatcher {
         return x to y
     }
 
-    /** Walk the scene graph and return entity objects with a known vtable. */
-    private fun findEntities(pid: Int, base: Long): List<Pair<Long, Int>> {
-        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return emptyList()
-        val scene = readLong(pid, director + 0xa0) ?: return emptyList()
-        val found = mutableListOf<Pair<Long, Int>>()
-        val visited = HashSet<Long>()
-        fun walk(node: Long, depth: Int) {
-            if (depth > 8 || found.size > 400 || !visited.add(node)) return
-            val vptr = readLong(pid, node) ?: return
-            ENTITY_VTABLES[vptr]?.let { found.add(node to it) }
-            for (child in children(pid, node)) walk(child, depth + 1)
-        }
-        walk(scene, 0)
-        return found
+    // ---- aimlock ----
+
+    /** View sway must be zeroed or bullets fly off-angle even when the reticle is right. */
+    private fun zeroSway(pid: Int, lc: Long) {
+        val view = readLong(pid, lc + 0x150) ?: return
+        if (view == 0L) return
+        val zero = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0f).array()
+        for (off in longArrayOf(0x298, 0x29c, 0x2a4)) writeBytes(pid, view + off, zero)
     }
 
-    /** Position chain mirrors each class's getBodyPosition() disassembly. */
-    private fun entityPosition(pid: Int, obj: Long, kind: Int): Pair<Double, Double>? {
-        val holder = when (kind) {
-            KIND_DRONE -> readLong(pid, readLong(pid, obj + 0x200) ?: return null) ?: return null
-            KIND_HAWK -> readLong(pid, readLong(pid, obj + 0x230) ?: return null) ?: return null
-            KIND_WORM -> readLong(pid, readLong(pid, obj + 0x228) ?: return null) ?: return null
-            else -> obj
-        }
-        val body = readLong(pid, holder + 0x1a8) ?: return null
-        if (body == 0L) return null
-        val x = readDouble(pid, body + 0x30) ?: return null
-        val y = readDouble(pid, body + 0x38) ?: return null
-        return x to y
+    /** Base firing angle from SoldierView::getFiringAngle with sway zeroed: view+0x2a0. */
+    private fun baseAngle(pid: Int, lc: Long): Float? {
+        val view = readLong(pid, lc + 0x150) ?: return null
+        if (view == 0L) return null
+        return readFloat(pid, view + 0x2a0)
     }
 
-    fun localPosition(pid: Int, base: Long): Pair<Double, Double>? {
-        val local = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) } ?: return null
-        return entityPosition(pid, local, KIND_LOCAL)
-    }
-
-    fun collectTargets(pid: Int, base: Long): List<EspTarget> {
-        val out = mutableListOf<EspTarget>()
-        for ((obj, kind) in findEntities(pid, base)) {
-            if (kind == KIND_LOCAL) continue
-            val pos = entityPosition(pid, obj, kind) ?: continue
-            out.add(EspTarget(pos.first, pos.second, kind, 0f))
-        }
-        return out
-    }
-
-    fun camera(pid: Int, base: Long): Camera? {
-        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
-        val width = readFloat(pid, director + 0xd0) ?: return null
-        val height = readFloat(pid, director + 0xd4) ?: return null
-        val scene = readLong(pid, director + 0xa0) ?: return null
-        var best = -1f
-        var camX = 0f
-        var camY = 0f
-        for (c1 in children(pid, scene)) {
-            val p1 = readPoint(pid, c1) ?: continue
-            for (c2 in children(pid, c1)) {
-                val p2 = readPoint(pid, c2) ?: continue
-                val mag = kotlin.math.abs(p2.first) + kotlin.math.abs(p2.second)
-                if (mag < 100f || mag > 8000f || mag <= best) continue
-                best = mag
-                camX = p1.first + p2.first
-                camY = p1.second + p2.second
-            }
-        }
-        return Camera(camX, camY, width, height)
-    }
-
-    private fun nearestEnemyAngle(pid: Int, base: Long): Float? {
-        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
-        val local = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) } ?: return null
-        val origin = entityPosition(pid, local, KIND_LOCAL) ?: return null
+    private fun aimAngle(pid: Int, base: Long): Float? {
+        val lc = localController(pid) ?: return null
+        zeroSway(pid, lc)
+        val origin = soldierPosition(pid, lc) ?: return baseAngle(pid, lc)
         var best = 4000.0
-        var angle: Float? = null
-        for (target in collectTargets(pid, base)) {
-            val dx = target.x - origin.first
-            val dy = target.y - origin.second
+        var found: Float? = null
+        for (t in collectTargets(pid, base)) {
+            val dx = t.x - origin.first
+            val dy = t.y - origin.second
             val dist = hypot(dx, dy)
             if (dist < 10.0 || dist >= best) continue
             best = dist
             var deg = (atan2(-dy, dx) * 180.0 / Math.PI).toFloat()
             if (deg < 0f) deg += 360f
-            angle = deg
+            found = deg
         }
-        return angle
+        // No target: return the live native angle so aim never freezes.
+        return found ?: baseAngle(pid, lc)
     }
 
     fun toggleAimlock(enable: Boolean): Boolean {
@@ -327,7 +359,7 @@ internal object MemoryPatcher {
                     val p = findPid()
                     val b = p?.let { findModuleBase(it) }
                     if (p != null && b != null) {
-                        nearestEnemyAngle(p, b)?.let { writeFloat(p, b + FIRE_ANGLE_OFFSET + 12, it) }
+                        aimAngle(p, b)?.let { writeFloat(p, b + FIRE_ANGLE_OFFSET + 12, it) }
                     }
                     try {
                         Thread.sleep(16)
