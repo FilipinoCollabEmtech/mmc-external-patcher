@@ -2,32 +2,33 @@
 
 A Flutter APK with a floating overlay injector for Mini Militia Classic. The app screen has one Launch button; every toggle lives in the floating panel over the game.
 
-## Overlay
+## Overlay toggles
 
-- **Launch** — requests "Display over other apps" if needed, shows the MMC badge, launches MMC, backgrounds itself.
-- **MMC badge** — draggable; tap to expand/collapse the panel.
-- **Panel** — dark themed, grouped toggles:
-  - **God Mode** — one toggle for all four damage functions
-  - **Infinite Ammo** — clip + reserve
-  - **Security Bypass** — hides H4X alerts, bypasses ballistics validation
-  - **Aimlock** — snaps fire angle to the nearest enemy
+- **God Mode** — one toggle for all four damage functions (humanoid/hawk/worm/soldier)
+- **Infinite Ammo** — clip + reserve
+- **Security Bypass** — hides H4X alerts, bypasses ballistics validation
+- **Aimlock** — snaps fire angle to the nearest enemy
+- **ESP Boxes / ESP Lines** — transparent full-screen overlay drawn from live memory
 
-## Why one God Mode toggle instead of four
+## Why aimlock was stuck, and what changed
 
-The native mod hooks four separate damage functions — humanoid, hawk, worm, and soldier controller. Disabling only one leaves the other entity types able to deal damage, so the panel applies all four as a single toggle.
+Investigation against the RE dump found three causes:
 
-## Aimlock
+1. The multiplayer player dictionary needed **two** pointer reads: `dict = *(*(base + 0x13bf260))`. Reading only one gave junk elements, so no target was ever found and the injected stub kept returning its initial `0.0f`.
+2. Campaign enemies are not in that dictionary at all — they live in `*(*(base + 0x13be0a0))`, with per-type body indirection (`+0x200` humanoid, `+0x230` hawk, `+0x228` worm).
+3. The stub had no "no target" fallback and the view sway fields were left non-zero.
 
-Implemented without any in-game injection. From the RE dump:
+Fixes in `MemoryPatcher.kt`:
+- double-dereferenced both dictionaries
+- walk the all-drones dictionary with vtable classification
+- zero `view+0x298/+0x29c/+0x2a4` (`view = *(localController + 0x150)`) each tick
+- when no target exists, write the live base angle `view+0x2a0` into the stub slot instead of leaving the last value
 
-- local controller: `**(libcocos2dcpp + 0x13bec80)`
-- remote players: `CCDictionary` at `*(base + 0x13bf260)`, elements at `+0x18`, linked via `+0x120`, controller at element `+0x108`
-- position: `controller + 0x1a8` → body, `body + 0x30/0x38` → x/y doubles
-- `Joypad::getFireAngle()` (`0x6888f0`) returns `[joypad + 0x180]`
+The stub itself is unchanged and verified correct: `adr x8,#12 / ldr s0,[x8] / ret / <float> / nops` over the 24-byte `Joypad::getFireAngle()` at `0x6888f0`.
 
-The patch overwrites `getFireAngle` with `ADR x8,#12 / LDR s0,[x8] / RET / <float> / NOPs`, and a background thread writes the computed angle (`atan2(-dy, dx)`, normalized to 0–360) into that slot every 16 ms. Toggling off restores the original 24 bytes.
+## ESP
 
-Writing another app's memory needs root (`su`) or a virtual container that owns the MMC process.
+`EspOverlay.kt` adds a transparent, touch-through WindowManager view and redraws at ~30 fps from `collectTargets()` + `camera()`. Camera comes from the director scene graph: `director = *(base+0x13ec228)`, `scene = *(director+0xa0)`, children at `node+0xb8` → `arr+0x18` → `{count at +0, objects at +8}`, node position at `+0x2c`. World→screen: `sx = x + camX`, `sy = winHeight - (y + camY)`.
 
 ## Build
 
