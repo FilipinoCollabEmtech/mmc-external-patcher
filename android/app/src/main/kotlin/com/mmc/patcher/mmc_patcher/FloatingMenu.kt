@@ -26,6 +26,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var expanded = false
     private var pid: Int? = null
     private var base: Long? = null
+    private var esp: EspOverlay? = null
 
     private val accent = Color.rgb(255, 82, 82)
     private val panelBg = Color.rgb(16, 16, 20)
@@ -64,6 +65,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
         icon = null
         panel = null
         expanded = false
+        esp?.hide()
+        esp = null
     }
 
     private fun rounded(color: Int, radius: Float): GradientDrawable = GradientDrawable().apply {
@@ -165,6 +168,28 @@ internal class FloatingMenu(private val activity: MainActivity) {
             }
         }
         container.addView(aimSwitch)
+
+        container.addView(sectionLabel("ESP"))
+        for ((label, isBoxes) in listOf("Boxes" to true, "Lines" to false)) {
+            val sw = Switch(activity).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                setPadding(6, 4, 0, 10)
+                isChecked = false
+            }
+            sw.setOnCheckedChangeListener { _, checked ->
+                if (esp == null) esp = EspOverlay(activity)
+                if (isBoxes) esp?.setBoxes(checked) else esp?.setLines(checked)
+                val bothOff = esp?.isOff() ?: true
+                if (bothOff) {
+                    esp?.hide()
+                    esp = null
+                }
+                toast("ESP $label: ${if (checked) "ON" else "OFF"}")
+            }
+            container.addView(sw)
+        }
 
         val minimize = TextView(activity).apply {
             text = "—  MINIMIZE  —"

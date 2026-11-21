@@ -10,11 +10,18 @@ import kotlin.math.hypot
 internal data class Patch(val name: String, val offset: Long, val hex: String)
 internal data class PatchGroup(val name: String, val patches: List<Patch>)
 
+internal const val KIND_DRONE = 1
+internal const val KIND_HAWK = 2
+internal const val KIND_WORM = 3
+internal const val KIND_AI = 4
+internal const val KIND_PLAYER = 5
+internal const val KIND_LOCAL = 6
+
+internal data class EspTarget(val x: Double, val y: Double, val kind: Int, val hp: Float)
+internal data class Camera(val x: Float, val y: Float, val width: Float, val height: Float)
+
 /** ARM64 byte patches from lgl_project/jni/Main.cpp, targeting libcocos2dcpp.so. */
 internal val PATCH_GROUPS = listOf(
-    // Four damage functions cover humanoid, hawk, worm and soldier controllers.
-    // They are one user-facing toggle because disabling any single one leaves other
-    // entity types able to deal damage.
     PatchGroup("God Mode", listOf(
         Patch("Humanoid damage", 0x67cffcL, "C0 03 5F D6"),
         Patch("Hawk damage", 0x677130L, "C0 03 5F D6"),
@@ -35,15 +42,20 @@ internal object MemoryPatcher {
     private const val TARGET_PACKAGE = "com.appsomniacs.mmc"
     private const val TARGET_LIB = "libcocos2dcpp.so"
 
-    // Joypad::getFireAngle() returns [joypad + 0x180]. We replace the 24-byte
-    // function with ADR x8,#12 / LDR s0,[x8] / RET / <float> / NOPs, so the game
-    // reads the angle we keep writing at +12.
     private const val FIRE_ANGLE_OFFSET = 0x6888f0L
-
-    // SoldierManager::getLocalController() -> **(base + 0x13bec80)
     private const val LOCAL_CONTROLLER_GLOBAL = 0x13bec80L
-    // Remote players live in a CCDictionary at *(base + 0x13bf260)
-    private const val REMOTE_DICT_GLOBAL = 0x13bf260L
+    private const val DIRECTOR_GLOBAL = 0x13ec228L
+
+    // VTable addresses from dynsyms; object vptr = vtable + 0x10.
+    private val ENTITY_VTABLES = mapOf(
+        0x1334610L + 0x10 to KIND_DRONE,      // HumanoidDrone
+        0x13337f0L + 0x10 to KIND_HAWK,       // HawkDrone
+        0x135a960L + 0x10 to KIND_WORM,       // WormDrone
+        0x1352120L + 0x10 to KIND_AI,         // SoldierAIController
+        0x1353580L + 0x10 to KIND_PLAYER,     // SoldierRemoteController
+        0x1352df0L + 0x10 to KIND_LOCAL,      // SoldierLocalController
+        0x132d1c0L + 0x10 to KIND_DRONE,      // Enemy
+    )
 
     private val originals = HashMap<Long, ByteArray>()
     private var aimThread: Thread? = null
@@ -111,13 +123,23 @@ internal object MemoryPatcher {
         } catch (_: Exception) {
             null
         } finally {
-            mem.close()
+            runCatching { mem.close() }
         }
     }
 
     private fun readLong(pid: Int, address: Long): Long? =
         readBytes(pid, address, 8)?.let {
             ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).long
+        }
+
+    private fun readInt(pid: Int, address: Long): Int? =
+        readBytes(pid, address, 4)?.let {
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).int
+        }
+
+    private fun readFloat(pid: Int, address: Long): Float? =
+        readBytes(pid, address, 4)?.let {
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).float
         }
 
     private fun readDouble(pid: Int, address: Long): Double? =
@@ -132,7 +154,6 @@ internal object MemoryPatcher {
             mem.write(bytes)
             true
         } catch (_: Exception) {
-            mem.close()
             writeViaShell(pid, address, bytes)
         } finally {
             runCatching { mem.close() }
@@ -140,11 +161,9 @@ internal object MemoryPatcher {
     }
 
     private fun writeFloat(pid: Int, address: Long, value: Float) {
-        val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array()
-        writeBytes(pid, address, buf)
+        writeBytes(pid, address, ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array())
     }
 
-    /** Root fallback: printf octal bytes into dd at the virtual address. */
     private fun writeViaShell(pid: Int, address: Long, bytes: ByteArray): Boolean {
         val octal = bytes.joinToString("") { "\\${(it.toInt() and 0xff).toString(8).padStart(3, '0')}" }
         val cmd = "printf '$octal' | dd of=/proc/$pid/mem bs=1 seek=$address conv=notrunc 2>/dev/null"
@@ -171,43 +190,109 @@ internal object MemoryPatcher {
         return allOk
     }
 
-    private fun localController(pid: Int, base: Long): Long? {
-        val sm = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL) ?: return null
-        if (sm == 0L) return null
-        return readLong(pid, sm)
-    }
+    // ---- scene graph traversal (cocos2d CCNode/CCArray layouts from disassembly) ----
 
-    private fun remoteControllers(pid: Int, base: Long): List<Long> {
-        val dict = readLong(pid, base + REMOTE_DICT_GLOBAL) ?: return emptyList()
-        if (dict == 0L) return emptyList()
-        var elem = readLong(pid, dict + 0x18) ?: return emptyList()
+    private fun children(pid: Int, node: Long): List<Long> {
+        val arr = readLong(pid, node + 0xb8) ?: return emptyList()
+        if (arr == 0L) return emptyList()
+        val data = readLong(pid, arr + 0x18) ?: return emptyList()
+        if (data == 0L) return emptyList()
+        val num = readInt(pid, data) ?: return emptyList()
+        if (num <= 0 || num > 512) return emptyList()
+        val objects = readLong(pid, data + 0x8) ?: return emptyList()
+        if (objects == 0L) return emptyList()
+        val buf = readBytes(pid, objects, num * 8) ?: return emptyList()
         val out = mutableListOf<Long>()
-        var guard = 0
-        while (elem != 0L && guard++ < 128) {
-            readLong(pid, elem + 0x108)?.let { if (it != 0L) out.add(it) }
-            elem = readLong(pid, elem + 0x120) ?: 0L
+        for (i in 0 until num) {
+            val v = ByteBuffer.wrap(buf, i * 8, 8).order(ByteOrder.LITTLE_ENDIAN).long
+            if (v != 0L) out.add(v)
         }
         return out
     }
 
-    /** SoldierController::getBodyPosition(): [ctrl+0x1a8] -> body, [body+0x30/0x38] = x/y doubles. */
-    private fun bodyPosition(pid: Int, controller: Long): Pair<Double, Double>? {
-        val body = readLong(pid, controller + 0x1a8) ?: return null
+    private fun readPoint(pid: Int, node: Long): Pair<Float, Float>? {
+        val x = readFloat(pid, node + 0x2c) ?: return null
+        val y = readFloat(pid, node + 0x30) ?: return null
+        return x to y
+    }
+
+    /** Walk the scene graph and return entity objects with a known vtable. */
+    private fun findEntities(pid: Int, base: Long): List<Pair<Long, Int>> {
+        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return emptyList()
+        val scene = readLong(pid, director + 0xa0) ?: return emptyList()
+        val found = mutableListOf<Pair<Long, Int>>()
+        val visited = HashSet<Long>()
+        fun walk(node: Long, depth: Int) {
+            if (depth > 8 || found.size > 400 || !visited.add(node)) return
+            val vptr = readLong(pid, node) ?: return
+            ENTITY_VTABLES[vptr]?.let { found.add(node to it) }
+            for (child in children(pid, node)) walk(child, depth + 1)
+        }
+        walk(scene, 0)
+        return found
+    }
+
+    /** Position chain mirrors each class's getBodyPosition() disassembly. */
+    private fun entityPosition(pid: Int, obj: Long, kind: Int): Pair<Double, Double>? {
+        val holder = when (kind) {
+            KIND_DRONE -> readLong(pid, readLong(pid, obj + 0x200) ?: return null) ?: return null
+            KIND_HAWK -> readLong(pid, readLong(pid, obj + 0x230) ?: return null) ?: return null
+            KIND_WORM -> readLong(pid, readLong(pid, obj + 0x228) ?: return null) ?: return null
+            else -> obj
+        }
+        val body = readLong(pid, holder + 0x1a8) ?: return null
         if (body == 0L) return null
         val x = readDouble(pid, body + 0x30) ?: return null
         val y = readDouble(pid, body + 0x38) ?: return null
         return x to y
     }
 
+    fun localPosition(pid: Int, base: Long): Pair<Double, Double>? {
+        val local = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) } ?: return null
+        return entityPosition(pid, local, KIND_LOCAL)
+    }
+
+    fun collectTargets(pid: Int, base: Long): List<EspTarget> {
+        val out = mutableListOf<EspTarget>()
+        for ((obj, kind) in findEntities(pid, base)) {
+            if (kind == KIND_LOCAL) continue
+            val pos = entityPosition(pid, obj, kind) ?: continue
+            out.add(EspTarget(pos.first, pos.second, kind, 0f))
+        }
+        return out
+    }
+
+    fun camera(pid: Int, base: Long): Camera? {
+        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
+        val width = readFloat(pid, director + 0xd0) ?: return null
+        val height = readFloat(pid, director + 0xd4) ?: return null
+        val scene = readLong(pid, director + 0xa0) ?: return null
+        var best = -1f
+        var camX = 0f
+        var camY = 0f
+        for (c1 in children(pid, scene)) {
+            val p1 = readPoint(pid, c1) ?: continue
+            for (c2 in children(pid, c1)) {
+                val p2 = readPoint(pid, c2) ?: continue
+                val mag = kotlin.math.abs(p2.first) + kotlin.math.abs(p2.second)
+                if (mag < 100f || mag > 8000f || mag <= best) continue
+                best = mag
+                camX = p1.first + p2.first
+                camY = p1.second + p2.second
+            }
+        }
+        return Camera(camX, camY, width, height)
+    }
+
     private fun nearestEnemyAngle(pid: Int, base: Long): Float? {
-        val lc = localController(pid, base) ?: return null
-        val origin = bodyPosition(pid, lc) ?: return null
+        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
+        val local = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) } ?: return null
+        val origin = entityPosition(pid, local, KIND_LOCAL) ?: return null
         var best = 4000.0
         var angle: Float? = null
-        for (enemy in remoteControllers(pid, base)) {
-            val pos = bodyPosition(pid, enemy) ?: continue
-            val dx = pos.first - origin.first
-            val dy = pos.second - origin.second
+        for (target in collectTargets(pid, base)) {
+            val dx = target.x - origin.first
+            val dy = target.y - origin.second
             val dist = hypot(dx, dy)
             if (dist < 10.0 || dist >= best) continue
             best = dist
@@ -227,17 +312,12 @@ internal object MemoryPatcher {
             originals[address] = original
 
             val patch = ByteArray(24)
-            // adr x8, #12
             patch[0] = 0x68.toByte(); patch[1] = 0x00.toByte(); patch[2] = 0x00.toByte(); patch[3] = 0x10.toByte()
-            // ldr s0, [x8]
             patch[4] = 0x00.toByte(); patch[5] = 0x01.toByte(); patch[6] = 0x40.toByte(); patch[7] = 0xBD.toByte()
-            // ret
             patch[8] = 0xC0.toByte(); patch[9] = 0x03.toByte(); patch[10] = 0x5F.toByte(); patch[11] = 0xD6.toByte()
-            // NOP padding
-            for (i in 16 until 24) {
-                patch[i] = when (i % 4) {
-                    0 -> 0x1F.toByte(); 1 -> 0x20.toByte(); 2 -> 0x03.toByte(); else -> 0xD5.toByte()
-                }
+            for (i in 16 until 24 step 4) {
+                patch[i] = 0x1F.toByte(); patch[i + 1] = 0x20.toByte()
+                patch[i + 2] = 0x03.toByte(); patch[i + 3] = 0xD5.toByte()
             }
             if (!writeBytes(pid, address, patch)) return false
 
