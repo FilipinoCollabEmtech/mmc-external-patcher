@@ -3,6 +3,7 @@ package com.mmc.patcher.mmc_patcher
 import android.annotation.SuppressLint
 import android.content.ComponentCallbacks
 import android.content.Context
+import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -10,6 +11,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -121,6 +124,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     /** Called from MainActivity after a rotation so the overlay follows the new bounds. */
     fun onConfigurationChanged() {
         val (screenW, screenH) = screenSize()
+        PatchLogger.log("UI", "config change ${screenW}x$screenH expanded=$expanded")
         if (expanded && panel != null) {
             val (width, height) = panelSize()
             panelParams.width = width
@@ -323,6 +327,20 @@ internal class FloatingMenu(private val activity: MainActivity) {
             ).apply { topMargin = dp(14) }
         })
 
+        container.addView(TextView(activity).apply {
+            text = "⧉  COPY LOGS"
+            caption(12f, Color.WHITE, bold = true)
+            gravity = Gravity.CENTER
+            letterSpacing = 0.06f
+            minimumHeight = dp(42)
+            background = pressable(Color.rgb(40, 43, 56), Color.rgb(58, 62, 78), dp(12).toFloat(), stroke)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(10) }
+            setOnClickListener { copyLogs() }
+        })
+
         scroll.addView(container, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         return scroll
     }
@@ -496,17 +514,40 @@ internal class FloatingMenu(private val activity: MainActivity) {
         val b = base ?: return
         if (espPid != p || espBase != b) {
             if (!MemoryPatcher.installInternalEsp(p, b)) {
+                PatchLogger.log("ESP", "install failed pid=$p base=0x${b.toString(16)}")
                 toast("ESP install failed")
                 return
             }
+            PatchLogger.log("ESP", "hook installed pid=$p base=0x${b.toString(16)}")
             espPid = p
             espBase = b
         }
+        PatchLogger.log("ESP", "flags boxes=$espBoxes lines=$espLines")
         MemoryPatcher.setEspFlags(p, b, espBoxes, espLines)
     }
 
     private fun toast(message: String) {
         Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Clipboard writes are blocked for background apps on newer Android, so if the
+     * direct copy fails, bring the launcher forward and retry once.
+     */
+    private fun copyLogs() {
+        PatchLogger.log("UI", "copy logs tapped")
+        if (PatchLogger.copyToClipboard(activity)) {
+            toast("Logs copied")
+            return
+        }
+        activity.startActivity(
+            Intent(activity, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            },
+        )
+        Handler(Looper.getMainLooper()).postDelayed({
+            toast(if (PatchLogger.copyToClipboard(activity)) "Logs copied" else "Copy failed - see files/mmc_patcher_log.txt")
+        }, 400)
     }
 
     // ---- open / close ----------------------------------------------------
@@ -533,6 +574,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
             panelParams.y = panelParams.y.coerceIn(0, (screenH - height).coerceAtLeast(0))
             wm.addView(panel, panelParams)
             expanded = true
+            PatchLogger.log("UI", "panel opened pid=$pid base=0x${base?.toString(16)}")
         } else {
             panel?.let { runCatching { wm.removeView(it) } }
             panel = null

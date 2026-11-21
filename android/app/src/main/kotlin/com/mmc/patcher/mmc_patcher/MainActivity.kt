@@ -15,6 +15,8 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        PatchLogger.installCrashHandler(applicationContext)
+        PatchLogger.log("APP", "launcher opened")
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel).setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
@@ -32,15 +34,20 @@ class MainActivity : FlutterActivity() {
 
                     val launch = packageManager.getLaunchIntentForPackage(targetPackage)
                     if (launch != null) {
+                        PatchLogger.log("APP", "launching MMC")
                         startActivity(launch)
                         moveTaskToBack(true)
                         result.success("started")
                     } else {
+                        PatchLogger.log("APP", "MMC not installed")
                         result.success("not_installed")
                     }
                 }
                 "isInstalled" -> {
                     result.success(packageManager.getLaunchIntentForPackage(targetPackage) != null)
+                }
+                "copyLogs" -> {
+                    result.success(if (PatchLogger.copyToClipboard(this@MainActivity)) "copied" else "failed")
                 }
                 else -> result.notImplemented()
             }

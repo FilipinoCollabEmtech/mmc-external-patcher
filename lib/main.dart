@@ -50,6 +50,19 @@ class _PatcherHomeState extends State<PatcherHome> {
     });
   }
 
+  Future<void> _copyLogs() async {
+    String? result;
+    try {
+      result = await _channel.invokeMethod<String>('copyLogs');
+    } on PlatformException catch (e) {
+      result = 'error: ${e.message}';
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(result == 'copied' ? 'Logs copied to clipboard' : 'Copy failed: $result')),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -78,6 +91,12 @@ class _PatcherHomeState extends State<PatcherHome> {
                 onPressed: _start,
                 icon: const Icon(Icons.play_arrow),
                 label: const Text('Launch'),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: _copyLogs,
+                icon: const Icon(Icons.copy),
+                label: const Text('Copy logs'),
               ),
               const SizedBox(height: 20),
               Text(

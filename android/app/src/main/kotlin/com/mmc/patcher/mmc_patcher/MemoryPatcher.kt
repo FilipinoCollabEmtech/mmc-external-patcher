@@ -464,9 +464,18 @@ internal object MemoryPatcher {
 
     /** Installs the in-process draw hook once. Refuses to run against an unknown build/cave. */
     fun installInternalEsp(pid: Int, base: Long): Boolean {
-        val orig = readBytes(pid, base + STAGE_DRAW_OFFSET, 4) ?: return false
-        if (!orig.contentEquals(hexToBytes("FF8300D1"))) return false
-        if (readBytes(pid, base + ESP_CODE_OFFSET, 4)?.any { it != 0.toByte() } != false) return false
+        val orig = readBytes(pid, base + STAGE_DRAW_OFFSET, 4) ?: run {
+            PatchLogger.log("ESP", "cannot read Stage::draw prologue")
+            return false
+        }
+        if (!orig.contentEquals(hexToBytes("FF8300D1"))) {
+            PatchLogger.log("ESP", "Stage::draw prologue mismatch: ${orig.joinToString(" ") { "%02X".format(it.toInt() and 0xff) }}")
+            return false
+        }
+        if (readBytes(pid, base + ESP_CODE_OFFSET, 4)?.any { it != 0.toByte() } != false) {
+            PatchLogger.log("ESP", "code cave not empty - already patched or wrong build")
+            return false
+        }
 
         val d = ByteBuffer.allocate(0xb8).order(ByteOrder.LITTLE_ENDIAN)
         d.putInt(0)                       // flags: bit0 boxes, bit1 lines
@@ -492,9 +501,18 @@ internal object MemoryPatcher {
             floatArrayOf(0.3f, 1f, 0.3f, 1f),
         ).forEach { color -> color.forEach { d.putFloat(it) } }
 
-        if (!writeBytes(pid, base + ESP_DATA_OFFSET, d.array())) return false
-        if (!writeBytes(pid, base + ESP_CODE_OFFSET, hexToBytes(ESP_ENGINE_HEX))) return false
-        if (!writeBytes(pid, base + STAGE_DRAW_OFFSET, hexToBytes("CEDEEF17"))) return false
+        if (!writeBytes(pid, base + ESP_DATA_OFFSET, d.array())) {
+            PatchLogger.log("ESP", "failed writing engine data table")
+            return false
+        }
+        if (!writeBytes(pid, base + ESP_CODE_OFFSET, hexToBytes(ESP_ENGINE_HEX))) {
+            PatchLogger.log("ESP", "failed writing engine code")
+            return false
+        }
+        if (!writeBytes(pid, base + STAGE_DRAW_OFFSET, hexToBytes("CEDEEF17"))) {
+            PatchLogger.log("ESP", "failed writing Stage::draw hook")
+            return false
+        }
         espSaved[base + STAGE_DRAW_OFFSET] = orig
         return true
     }
