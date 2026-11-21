@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 
@@ -30,6 +31,38 @@
 #ifndef PTRACE_SETREGS
 #define PTRACE_SETREGS 13
 #endif
+/* Some ROMs reject PTRACE_GETREGS/SETREGS with EIO; REGSET is the modern path. */
+#ifndef PTRACE_GETREGSET
+#define PTRACE_GETREGSET 0x4204
+#endif
+#ifndef PTRACE_SETREGSET
+#define PTRACE_SETREGSET 0x4205
+#endif
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+
+static bool get_regs(pid_t pid, struct user_regs_struct *r) {
+    struct iovec iov{};
+    iov.iov_base = r;
+    iov.iov_len = sizeof(*r);
+    if (ptrace(PTRACE_GETREGSET, pid, (void *) NT_PRSTATUS, &iov) != -1) return true;
+    LOGE("GETREGSET failed: %s", strerror(errno));
+    if (ptrace(PTRACE_GETREGS, pid, 0, r) != -1) return true;
+    LOGE("GETREGS fallback failed: %s", strerror(errno));
+    return false;
+}
+
+static bool set_regs(pid_t pid, struct user_regs_struct *r) {
+    struct iovec iov{};
+    iov.iov_base = r;
+    iov.iov_len = sizeof(*r);
+    if (ptrace(PTRACE_SETREGSET, pid, (void *) NT_PRSTATUS, &iov) != -1) return true;
+    LOGE("SETREGSET failed: %s", strerror(errno));
+    if (ptrace(PTRACE_SETREGS, pid, 0, r) != -1) return true;
+    LOGE("SETREGS fallback failed: %s", strerror(errno));
+    return false;
+}
 
 /* Region inside the target: payload + literals + path + trap + private stack. */
 static const uintptr_t kRegionSize = 0x10000;
@@ -127,8 +160,8 @@ int injector_inject(pid_t pid, const char *path) {
     }
 
     struct user_regs_struct saved;
-    if (ptrace(PTRACE_GETREGS, pid, 0, &saved) == -1) {
-        LOGE("PTRACE_GETREGS failed: %s", strerror(errno));
+    if (!get_regs(pid, &saved)) {
+        LOGE("cannot read target registers");
         ptrace(PTRACE_DETACH, pid, 0, 0);
         return INJECT_ERR_GETREGS;
     }
@@ -171,8 +204,8 @@ int injector_inject(pid_t pid, const char *path) {
     r.regs[4] = (uint64_t)-1;
     r.regs[5] = 0;
     r.regs[30] = 0;      /* return target traps -> we catch the fault */
-    if (ptrace(PTRACE_SETREGS, pid, 0, &r) == -1) {
-        LOGE("SETREGS (mmap) failed: %s", strerror(errno));
+    if (!set_regs(pid, &r)) {
+        LOGE("SETREGS (mmap) failed");
         rc = INJECT_ERR_SETREGS;
         goto restore_and_detach;
     }
@@ -185,7 +218,7 @@ int injector_inject(pid_t pid, const char *path) {
 
     {
         struct user_regs_struct after_mmap;
-        if (ptrace(PTRACE_GETREGS, pid, 0, &after_mmap) == -1) {
+        if (!get_regs(pid, &after_mmap)) {
             rc = INJECT_ERR_GETREGS;
             goto restore_and_detach;
         }
@@ -240,8 +273,8 @@ int injector_inject(pid_t pid, const char *path) {
         r.regs[30] = rwx + kTrapOff;      /* brk #0 after payload returns    */
         r.regs[0] = path_ptr;
         r.regs[1] = 2;
-        if (ptrace(PTRACE_SETREGS, pid, 0, &r) == -1) {
-            LOGE("SETREGS (payload) failed: %s", strerror(errno));
+        if (!set_regs(pid, &r)) {
+            LOGE("SETREGS (payload) failed");
             rc = INJECT_ERR_SETREGS;
             goto restore_and_detach;
         }
@@ -263,8 +296,8 @@ int injector_inject(pid_t pid, const char *path) {
     }
 
 restore_and_detach:
-    if (ptrace(PTRACE_SETREGS, pid, 0, &saved) == -1)
-        LOGE("SETREGS restore failed: %s", strerror(errno));
+    if (!set_regs(pid, &saved))
+        LOGE("SETREGS restore failed");
     if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1)
         LOGE("PTRACE_DETACH failed: %s", strerror(errno));
     LOGI("inject finished rc=%d", rc);
