@@ -53,6 +53,17 @@ internal object MemoryPatcher {
     private const val ESP_DATA_OFFSET = 0x500b10L
     private const val MPROTECT_OFFSET = 0x4d51d0L
 
+    // LOS probe: runs inside the aimlock getter and calls the game's segment query.
+    private const val LOS_CODE_OFFSET = 0x500c00L
+    private const val LOS_DATA_OFFSET = 0x500e00L
+    private const val LOS_ENGINE_HEX =
+        "ff8300d1e00300f9fe0700f9f35301a9930f0010740240b9b4030034601240bd0020201e46030054740640f915bf81d21578a2f2956a75f8b50200b4b50240f9750200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9800000b534008052740600b90500001414008052740600b9f70340f9e08241bdf35341a9fe0740f9ff830091c0035fd6"
+
+    @Volatile private var losActive = false
+    @Volatile private var losOrigin = Pair(0.0, 0.0)
+    @Volatile private var losTarget = Pair(0.0, 0.0)
+    private val losSaved = HashMap<Long, ByteArray>()
+
     private const val ESP_ENGINE_HEX =
         "ff4303d1fd7b0ba9f35300a9f55b01a9f76302a9f96b03a9fb7304a9e827803de06300f9f33e0010600640b920010035e00313aa00cc7492010084d2e20080d2" +
         "701e40f900023fd620008052600600b9e06340f9ff8300d11d2110947c0240b97c0e0034e06340f9612a40f91f0001eb80000054602a00f97f2200f97f2600f9" +
@@ -390,6 +401,7 @@ internal object MemoryPatcher {
         val lc = localController(pid, base) ?: return Float.NaN
         zeroSway(pid, lc)
         val origin = soldierPosition(pid, lc) ?: return Float.NaN
+        losOrigin = origin
         var best = 4000.0
         var found = Float.NaN
         for (t in collectTargets(pid, base)) {
@@ -401,6 +413,7 @@ internal object MemoryPatcher {
             var deg = (atan2(-dy, dx) * 180.0 / Math.PI).toFloat()
             if (deg < 0f) deg += 360f
             found = deg
+            losTarget = t.x to t.y
         }
         return found
     }
@@ -423,7 +436,9 @@ internal object MemoryPatcher {
                     val p = findPid()
                     val b = p?.let { findModuleBase(it) }
                     if (p != null && b != null) {
-                        writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, aimAngle(p, b))
+                        val angle = aimAngle(p, b)
+                        writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, angle)
+                        writeLosFrame(p, b, angle)
                     }
                     try {
                         Thread.sleep(16)
@@ -434,6 +449,9 @@ internal object MemoryPatcher {
             }.apply { isDaemon = true; start() }
             return true
         } else {
+            val losPid = findPid()
+            val losBase = losPid?.let { findModuleBase(it) }
+            if (losPid != null && losBase != null) uninstallLos(losPid, losBase)
             aimRunning = false
             aimThread?.interrupt()
             try {
@@ -524,6 +542,78 @@ internal object MemoryPatcher {
         }
     }
 
+    // ---- line of sight ---------------------------------------------------
+
+    /** Installs a code-cave LOS probe behind the aimlock getter. Requires aimlock on. */
+    fun installLos(pid: Int, base: Long): Boolean {
+        if (losActive) return true
+        val address = base + FIRE_ANGLE_OFFSET
+        if (!originals.containsKey(address)) {
+            PatchLogger.log("LOS", "enable aimlock first")
+            return false
+        }
+        val saved = readBytes(pid, base + LOS_CODE_OFFSET, 4)
+        if (saved == null || !saved.all { it == 0.toByte() }) {
+            PatchLogger.log("LOS", "LOS cave not empty")
+            return false
+        }
+        val stub = hexToBytes("C4E0F917")  // b 0x500c00 from 0x6888f0
+        val prev = readBytes(pid, address, 24) ?: return false
+        val data = ByteBuffer.allocate(0xa0).order(ByteOrder.LITTLE_ENDIAN)
+        data.putInt(1)                       // flags: enabled
+        data.putInt(0)                       // visible
+        data.putLong(base)                   // base
+        data.putFloat(Float.NaN)             // angle (NaN = no target)
+        data.putFloat(0f)                    // pad
+        data.putDouble(losOrigin.first)
+        data.putDouble(losOrigin.second)
+        data.putDouble(losTarget.first)
+        data.putDouble(losTarget.second)
+        data.putLong(0)                      // space debug
+        data.putLong(0)                      // query result debug
+        repeat(4) { data.putLong(0) }        // 32-byte zeroed query info
+        if (!writeBytes(pid, base + LOS_DATA_OFFSET, data.array())) return false
+        if (!writeBytes(pid, base + LOS_CODE_OFFSET, hexToBytes(LOS_ENGINE_HEX))) return false
+        if (!writeBytes(pid, address, stub)) return false
+        losSaved[address] = prev
+        losActive = true
+        PatchLogger.log("LOS", "installed")
+        return true
+    }
+
+    /** Called by the aim thread each tick with the current angle and target. */
+    fun writeLosFrame(pid: Int, base: Long, angle: Float) {
+        if (!losActive) return
+        val d = base + LOS_DATA_OFFSET
+        val b = ByteBuffer.allocate(0x50).order(ByteOrder.LITTLE_ENDIAN)
+        b.putInt(1)                 // keep LOS enabled
+        b.putInt(0)                 // visible set by engine
+        b.putLong(base)
+        b.putFloat(angle)
+        b.putFloat(0f)
+        b.putDouble(losOrigin.first)
+        b.putDouble(losOrigin.second)
+        b.putDouble(losTarget.first)
+        b.putDouble(losTarget.second)
+        b.putLong(0)
+        b.putLong(0)
+        writeBytes(pid, d, b.array())
+    }
+
+    fun uninstallLos(pid: Int, base: Long) {
+        if (!losActive) return
+        losActive = false
+        val address = base + FIRE_ANGLE_OFFSET
+        losSaved.remove(address)?.let { writeBytes(pid, address, it) }
+        PatchLogger.log("LOS", "uninstalled")
+    }
+
+    fun losVisible(pid: Int, base: Long): Boolean? {
+        if (!losActive) return null
+        val v = readInt(pid, base + LOS_DATA_OFFSET + 4) ?: return null
+        return v == 1
+    }
+
     /** Live readout of every value the in-game ESP engine reads, for debugging. */
     @Suppress("JoinDeclarationAndAssignment")
     fun espDebugInfo(pid: Int, base: Long): String {
@@ -597,6 +687,11 @@ internal object MemoryPatcher {
             val pos = soldierPosition(pid, ctrl)
             sb.appendLine("  ${hx(ctrl)} body=${hx(readLong(pid, ctrl + 0x1a8))} xy=${pos?.first?.toInt()},${pos?.second?.toInt()}")
         }
+        val ld = base + LOS_DATA_OFFSET
+        sb.appendLine("LOS: active=$losActive visible=${readInt(pid, ld + 4)} " +
+            "space=${hx(readLong(pid, ld + 0x40))} result=${hx(readLong(pid, ld + 0x48))} " +
+            "start=${losOrigin.first.toInt()},${losOrigin.second.toInt()} " +
+            "end=${losTarget.first.toInt()},${losTarget.second.toInt()}")
         return sb.toString()
     }
 }

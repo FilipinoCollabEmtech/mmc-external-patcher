@@ -298,6 +298,17 @@ internal class FloatingMenu(private val activity: MainActivity) {
         container.addView(toggleRow("aim", "◎", "Aimlock", "Snap to the nearest enemy") { checked ->
             toggleAimlock(checked)
         })
+        container.addView(toggleRow("los", "▤", "Wall Check (LOS)", "Only lock targets you can actually see") { checked ->
+            if (!ensureAttached()) {
+                toast("Launch MMC first")
+                false
+            } else if (!checked) {
+                MemoryPatcher.uninstallLos(pid!!, base!!)
+                true
+            } else {
+                MemoryPatcher.installLos(pid!!, base!!)
+            }
+        })
         container.addView(toggleRow("espBoxes", "▣", "ESP Boxes", "Outline targets through walls") { checked ->
             setEsp(boxes = checked)
             true
