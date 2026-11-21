@@ -40,6 +40,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var espBoxes = false
     private var espLines = false
     private var debug: DebugOverlay? = null
+    private var espDebug: EspDebugOverlay? = null
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
     private val states = LinkedHashMap<String, Boolean>()
@@ -119,6 +120,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
         espPid?.let { p -> espBase?.let { b -> MemoryPatcher.setEspFlags(p, b, false, false) } }
         debug?.hide()
         debug = null
+        espDebug?.hide()
+        espDebug = null
     }
 
     /** Called from MainActivity after a rotation so the overlay follows the new bounds. */
@@ -312,6 +315,16 @@ internal class FloatingMenu(private val activity: MainActivity) {
             } else {
                 debug?.hide()
                 debug = null
+            }
+            true
+        })
+        container.addView(toggleRow("espDebug", "▤", "ESP Debugger", "Live hook, world and target values") { checked ->
+            if (checked) {
+                if (espDebug == null) espDebug = EspDebugOverlay(activity)
+                espDebug?.show()
+            } else {
+                espDebug?.hide()
+                espDebug = null
             }
             true
         })
@@ -555,6 +568,9 @@ internal class FloatingMenu(private val activity: MainActivity) {
      */
     private fun copyLogs() {
         PatchLogger.log("UI", "copy logs tapped")
+        MemoryPatcher.attach()?.let { (p, b) ->
+            runCatching { PatchLogger.log("ESPDBG", MemoryPatcher.espDebugInfo(p, b)) }
+        }
         if (PatchLogger.copyToClipboard(activity)) {
             toast("Logs copied")
             return

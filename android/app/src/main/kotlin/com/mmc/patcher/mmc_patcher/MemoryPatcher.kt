@@ -534,4 +534,80 @@ internal object MemoryPatcher {
             writeBytes(pid, base + STAGE_DRAW_OFFSET, it)
         }
     }
+
+    /** Live readout of every value the in-game ESP engine reads, for debugging. */
+    @Suppress("JoinDeclarationAndAssignment")
+    fun espDebugInfo(pid: Int, base: Long): String {
+        fun hx(v: Long?) = v?.let { "0x${it.toString(16)}" } ?: "null"
+        val sb = StringBuilder()
+        val d = base + ESP_DATA_OFFSET
+        sb.appendLine("=== ESP DEBUG ===")
+        sb.appendLine("pid=$pid base=${hx(base)}")
+
+        val hook = readBytes(pid, base + STAGE_DRAW_OFFSET, 4)
+        val hookText = hook?.joinToString(" ") { "%02X".format(it.toInt() and 0xff) } ?: "unreadable"
+        val installed = hook?.contentEquals(hexToBytes("CEDEEF17")) == true
+        sb.appendLine("hook@0x9087d8: $hookText ${if (installed) "INSTALLED" else "ORIGINAL/none"}")
+        sb.appendLine("data@0x500b10: flags=${readInt(pid, d)} init=${readInt(pid, d + 4)}")
+
+        val names = listOf("create", "addChild", "clear", "segment", "dot", "mprotect")
+        names.forEachIndexed { i, name ->
+            sb.appendLine("  $name=${hx(readLong(pid, d + 0x10L + i * 8))}")
+        }
+        sb.appendLine("  drawNode=${hx(readLong(pid, d + 0x40))} world=${hx(readLong(pid, d + 0x48))} stage=${hx(readLong(pid, d + 0x50))}")
+
+        fun dict(label: String, global: Long) {
+            val slot = base + global
+            val holder = readLong(pid, slot)
+            val dict = holder?.let { readLong(pid, it) }
+            val first = dict?.let { readLong(pid, it + 0x18) }
+            sb.appendLine("  $label slot=${hx(slot)} holder=${hx(holder)} dict=${hx(dict)} first=${hx(first)}")
+        }
+        dict("drones", ALL_DRONES_GLOBAL)
+        dict("players", REMOTE_PLAYERS_GLOBAL)
+
+        val lcHolder = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)
+        val lc = lcHolder?.let { readLong(pid, it) }
+        val body = lc?.let { readLong(pid, it + 0x1a8) }
+        val lx = body?.let { readDouble(pid, it + 0x30) }
+        val ly = body?.let { readDouble(pid, it + 0x38) }
+        sb.appendLine("  local holder=${hx(lcHolder)} ctrl=${hx(lc)} body=${hx(body)} xy=${lx?.toInt()},${ly?.toInt()}")
+
+        val director = readLong(pid, base + DIRECTOR_GLOBAL)
+        val scene = director?.let { readLong(pid, it + 0xa0) }
+        sb.appendLine("director=${hx(director)} scene=${hx(scene)}")
+
+        if (scene != null && scene != 0L) {
+            val list = mutableListOf<Triple<Float, Long, Long>>()
+            for (c1 in children(pid, scene)) {
+                val p1 = readPoint(pid, c1) ?: continue
+                for (c2 in children(pid, c1)) {
+                    val p2 = readPoint(pid, c2) ?: continue
+                    val mag = kotlin.math.abs(p2.first) + kotlin.math.abs(p2.second)
+                    if (mag in 100f..8000f) list.add(Triple(mag, c2, c1))
+                }
+            }
+            sb.appendLine("world candidates=${list.size}")
+            list.sortedByDescending { it.first }.take(4).forEach {
+                sb.appendLine("  mag=${it.first.toInt()} node=${hx(it.second)} parent=${hx(it.third)}")
+            }
+        } else {
+            sb.appendLine("world candidates=scene missing")
+        }
+
+        val drones = dictionaryObjects(pid, base, ALL_DRONES_GLOBAL)
+        sb.appendLine("drones objects=${drones.size}")
+        drones.take(5).forEach { obj ->
+            val vptr = readLong(pid, obj)
+            val pos = dronePosition(pid, base, obj)
+            sb.appendLine("  ${hx(obj)} vptr-base=${hx(vptr?.minus(base))} xy=${pos?.first?.toInt()},${pos?.second?.toInt()}")
+        }
+        val players = dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)
+        sb.appendLine("players objects=${players.size}")
+        players.take(5).forEach { ctrl ->
+            val pos = soldierPosition(pid, ctrl)
+            sb.appendLine("  ${hx(ctrl)} body=${hx(readLong(pid, ctrl + 0x1a8))} xy=${pos?.first?.toInt()},${pos?.second?.toInt()}")
+        }
+        return sb.toString()
+    }
 }
