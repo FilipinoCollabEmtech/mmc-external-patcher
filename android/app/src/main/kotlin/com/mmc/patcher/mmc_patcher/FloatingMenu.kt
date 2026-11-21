@@ -1,7 +1,9 @@
 package com.mmc.patcher.mmc_patcher
 
 import android.annotation.SuppressLint
+import android.content.ComponentCallbacks
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -37,7 +39,6 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private val states = LinkedHashMap<String, Boolean>()
 
     private val accent = Color.rgb(255, 92, 92)
-    private val accentSoft = Color.rgb(72, 32, 38)
     private val bg = Color.argb(248, 17, 18, 25)
     private val cardOff = Color.rgb(31, 33, 43)
     private val cardPressed = Color.rgb(43, 46, 59)
@@ -50,6 +51,23 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
     private val density: Float get() = activity.resources.displayMetrics.density
     private fun dp(value: Int): Int = (value * density).toInt()
+
+    /** Live window bounds — displayMetrics can stay portrait despite a rotation. */
+    private fun screenSize(): Pair<Int, Int> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = wm.currentWindowMetrics.bounds
+            return (b.right - b.left) to (b.bottom - b.top)
+        }
+        val dm = activity.resources.displayMetrics
+        return dm.widthPixels to dm.heightPixels
+    }
+
+    private fun panelSize(): Pair<Int, Int> {
+        val (screenW, screenH) = screenSize()
+        val width = dp(300).coerceAtMost((screenW - dp(16)).coerceAtLeast(dp(200)))
+        val maxHeight = (screenH - dp(32)).coerceAtLeast(dp(160))
+        return width to minOf(maxHeight, dp(660))
+    }
 
     private fun overlayParams(): WindowManager.LayoutParams {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -72,13 +90,21 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var iconParams = overlayParams()
     private var panelParams = overlayParams()
 
+    /** Application-level so rotation is still seen while the patcher activity is backgrounded. */
+    private val configCallback = object : ComponentCallbacks {
+        override fun onConfigurationChanged(newConfig: Configuration) = this@FloatingMenu.onConfigurationChanged()
+        override fun onLowMemory() = Unit
+    }
+
     fun show() {
         if (icon != null) return
+        activity.application.registerComponentCallbacks(configCallback)
         icon = buildIcon()
         wm.addView(icon, iconParams)
     }
 
     fun hide() {
+        runCatching { activity.application.unregisterComponentCallbacks(configCallback) }
         icon?.let { runCatching { wm.removeView(it) } }
         panel?.let { runCatching { wm.removeView(it) } }
         icon = null
@@ -88,6 +114,26 @@ internal class FloatingMenu(private val activity: MainActivity) {
         esp = null
         debug?.hide()
         debug = null
+    }
+
+    /** Called from MainActivity after a rotation so the overlay follows the new bounds. */
+    fun onConfigurationChanged() {
+        val (screenW, screenH) = screenSize()
+        if (expanded && panel != null) {
+            val (width, height) = panelSize()
+            panelParams.width = width
+            panelParams.height = height
+            panelParams.x = panelParams.x.coerceIn(0, (screenW - width).coerceAtLeast(0))
+            panelParams.y = panelParams.y.coerceIn(0, (screenH - height).coerceAtLeast(0))
+            iconParams.x = panelParams.x
+            iconParams.y = panelParams.y
+            runCatching { wm.updateViewLayout(panel, panelParams) }
+        } else {
+            val badge = dp(56)
+            iconParams.x = iconParams.x.coerceIn(0, (screenW - badge).coerceAtLeast(0))
+            iconParams.y = iconParams.y.coerceIn(0, (screenH - badge).coerceAtLeast(0))
+            icon?.let { runCatching { wm.updateViewLayout(it, iconParams) } }
+        }
     }
 
     // ---- drawables -------------------------------------------------------
@@ -471,16 +517,12 @@ internal class FloatingMenu(private val activity: MainActivity) {
             panel = buildPanel()
             panelParams.x = iconParams.x
             panelParams.y = iconParams.y
-            val dm = activity.resources.displayMetrics
-            val width = dp(300)
-            // Landscape screens can be shorter than the old dp(280) minimum, which
-            // pushed the lower rows off-screen and made them impossible to reach.
-            val maxHeight = (dm.heightPixels - dp(32)).coerceAtLeast(dp(180))
-            val height = minOf(maxHeight, dp(660))
+            val (screenW, screenH) = screenSize()
+            val (width, height) = panelSize()
             panelParams.width = width
             panelParams.height = height
-            panelParams.x = panelParams.x.coerceIn(0, (dm.widthPixels - width).coerceAtLeast(0))
-            panelParams.y = panelParams.y.coerceIn(0, (dm.heightPixels - height).coerceAtLeast(0))
+            panelParams.x = panelParams.x.coerceIn(0, (screenW - width).coerceAtLeast(0))
+            panelParams.y = panelParams.y.coerceIn(0, (screenH - height).coerceAtLeast(0))
             wm.addView(panel, panelParams)
             expanded = true
         } else {

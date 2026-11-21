@@ -1,6 +1,7 @@
 package com.mmc.patcher.mmc_patcher
 
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
@@ -44,6 +45,11 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        floatingMenu?.onConfigurationChanged()
     }
 
     override fun onDestroy() {
