@@ -48,6 +48,27 @@ internal object PatchLogger {
         }
     }
 
+    /** Collapses consecutive repeats (timestamps/numbers ignored) into "xN". */
+    private fun collapse(lines: List<String>): List<String> {
+        fun key(line: String): String {
+            var s = Regex("""^\[\d\d-\d\d \d\d:\d\d:\d\d\.\d+\]\s+""").replace(line, "")
+            s = Regex("""^\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+\d+\s+\d+\s+""").replace(s, "")
+            s = Regex("0x[0-9a-fA-F]+").replace(s, "0xADDR")
+            return Regex("""\b\d+\b""").replace(s, "N").trim()
+        }
+        val out = mutableListOf<String>()
+        var i = 0
+        while (i < lines.size) {
+            val k = key(lines[i])
+            var j = i + 1
+            while (j < lines.size && key(lines[j]) == k) j++
+            val count = j - i
+            out += lines[i] + if (count > 1) "  [x$count]" else ""
+            i = j
+        }
+        return out
+    }
+
     fun collect(context: Context): String {
         val sb = StringBuilder()
         sb.appendLine("=== MMC Patcher logs ===")
@@ -56,7 +77,7 @@ internal object PatchLogger {
         sb.appendLine("app: ${context.packageName}")
         sb.appendLine()
         sb.appendLine("--- app events ---")
-        synchronized(events) { events.forEach { sb.appendLine(it) } }
+        synchronized(events) { collapse(events.toList()).forEach { sb.appendLine(it) } }
         sb.appendLine()
         val logcat = readLogcat().lines().filter {
             !it.contains("avc: denied") && !it.contains("type=1400 audit")
@@ -84,7 +105,7 @@ internal object PatchLogger {
         sb.appendLine(readDmesg())
         sb.appendLine()
         sb.appendLine("--- logcat tail (last 120 lines) ---")
-        logcat.takeLast(120).forEach { sb.appendLine(it) }
+        collapse(logcat.takeLast(120)).forEach { sb.appendLine(it) }
         val text = sb.toString()
         runCatching { File(context.filesDir, "mmc_patcher_log.txt").writeText(text) }
         return text
