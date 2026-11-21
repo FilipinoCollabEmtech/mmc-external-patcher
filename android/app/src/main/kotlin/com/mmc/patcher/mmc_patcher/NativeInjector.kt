@@ -130,25 +130,57 @@ internal object NativeInjector {
         return if (runSu(cmd) == 0) CLI_REMOTE else null
     }
 
-    /** Runs the injector as root, falling back to in-process JNI for root installs. */
+    /** Logs the UID/ptrace constraints that decide whether attach can work. */
+    private fun logPrivilegeContext(pid: Int) {
+        fun uidOf(path: String) = try {
+            File(path).readLines().firstOrNull { it.startsWith("Uid:") }?.trim() ?: "?"
+        } catch (_: Exception) { "?" }
+        val scope = try {
+            File("/proc/sys/kernel/yama/ptrace_scope").readText().trim()
+        } catch (_: Exception) { "?" }
+        PatchLogger.log(
+            TAG,
+            "privilege self=${uidOf("/proc/self/status")} game=${uidOf("/proc/$pid/status")} " +
+                "ptrace_scope=$scope jniAvailable=$jniAvailable",
+        )
+    }
+
+    /**
+     * Prefer in-process injection: the patcher and game are both hosted by the
+     * same VirtualApp, so PTRACE_ATTACH can work without root. The su CLI is a
+     * last resort only.
+     */
     private fun inject(pid: Int, soPath: String): InjectResult {
-        val cli = appContext?.let { stageCli(it) }
-        if (cli != null) {
-            val cmd = "'$cli' $pid '$soPath'"
-            val out = runSuCapture(cmd)
-            val rc = extractRc(out)
-            PatchLogger.log(TAG, "CLI out=${out.trim()}")
-            if (rc == 0) return InjectResult(true, "loaded $soPath")
-            if (rc != Int.MIN_VALUE) return InjectResult(false, "injector rc=$rc (${describe(rc)})")
-        }
+        logPrivilegeContext(pid)
+        val attempts = mutableListOf<String>()
         if (jniAvailable) {
             val rc = nativeInject(pid, soPath)
-            return if (rc == 0)
-                InjectResult(true, "loaded $soPath (JNI)")
-            else
-                InjectResult(false, "JNI injector rc=$rc (${describe(rc)})")
+            PatchLogger.log(TAG, "direct JNI rc=$rc path=$soPath")
+            if (rc == 0) return InjectResult(true, "loaded $soPath (direct JNI)")
+            attempts += "direct JNI rc=$rc (${describe(rc)})"
         }
-        return InjectResult(false, "root injector CLI missing and JNI unavailable - rebuild with NDK/CMake")
+        val cli = appContext?.let { stageCli(it) }
+        if (cli != null) {
+            val out = runSuCapture("'$cli' $pid '$soPath'")
+            val rc = extractRc(out)
+            PatchLogger.log(TAG, "CLI out=${out.trim()}")
+            if (rc == 0) return InjectResult(true, "loaded $soPath (CLI)")
+            if (rc != Int.MIN_VALUE) attempts += "CLI rc=$rc (${describe(rc)})"
+        }
+        return InjectResult(false, attempts.joinToString("; ").ifBlank { "no injector path available" })
+    }
+
+    /** Try our own readable path first; only fall back to root staging if needed. */
+    private fun loadSo(pid: Int, local: String, destName: String): InjectResult {
+        val direct = inject(pid, local)
+        if (direct.ok) return direct
+        val staged = stageIntoGame(pid, local, destName)
+        if (staged != null && staged != local) {
+            val retry = inject(pid, staged)
+            if (retry.ok) return retry
+            return InjectResult(false, "${direct.detail}; staged retry: ${retry.detail}")
+        }
+        return direct
     }
 
     fun loadLgl(context: Context): InjectResult {
@@ -160,14 +192,11 @@ internal object NativeInjector {
         status = "STAGING"
         val local = stageFromAsset(context, LGL_ASSET, LGL_ASSET)
             ?: return InjectResult(false, "libMyLibName.so asset missing").also { status = "ASSET MISSING"; notifyState() }
-        val dest = stageIntoGame(pid, local, LGL_ASSET)
-            ?: return InjectResult(false, "could not stage .so into game dir").also { status = "STAGE FAILED"; notifyState() }
-
         status = "REVERTING LOCAL PATCHES"
         disableConflictingPatches()
 
         status = "INJECTING"
-        val result = inject(pid, dest)
+        val result = loadSo(pid, local, LGL_ASSET)
         active = result.ok
         status = if (result.ok) "LGL LOADED pid=$pid" else result.detail
         PatchLogger.log(TAG, "loadLgl ${if (result.ok) "OK" else "FAILED"}: ${result.detail}")
@@ -187,10 +216,8 @@ internal object NativeInjector {
         val local = stageFromNativeLib(context, MARKER_ASSET, "libmmcmarker.so")
             ?: stageFromAsset(context, MARKER_ASSET, "libmmcmarker.so")
             ?: return InjectResult(false, "libmarker.so missing (NDK/CMake build required)")
-        val dest = stageIntoGame(pid, local, "libmmcmarker.so")
-            ?: return InjectResult(false, "could not stage marker .so")
         runSu("rm -f '$MARKER_FILE'")
-        val result = inject(pid, dest)
+        val result = loadSo(pid, local, "libmmcmarker.so")
         if (!result.ok) return result
         val marker = runSuCapture("cat '$MARKER_FILE' 2>/dev/null").trim()
         val ok = marker.contains("MMC_INJECTOR_DLOPEN_OK")
