@@ -223,6 +223,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         val scroll = ScrollView(activity).apply {
             isVerticalScrollBarEnabled = true
             scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
+            isScrollbarFadingEnabled = false
             isFillViewport = true
             clipToPadding = false
             setPadding(0, 0, dp(2), 0)
@@ -472,7 +473,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
             panelParams.y = iconParams.y
             val dm = activity.resources.displayMetrics
             val width = dp(300)
-            val height = (dm.heightPixels - dp(110)).coerceIn(dp(280), dp(660))
+            // Landscape screens can be shorter than the old dp(280) minimum, which
+            // pushed the lower rows off-screen and made them impossible to reach.
+            val maxHeight = (dm.heightPixels - dp(32)).coerceAtLeast(dp(180))
+            val height = minOf(maxHeight, dp(660))
             panelParams.width = width
             panelParams.height = height
             panelParams.x = panelParams.x.coerceIn(0, (dm.widthPixels - width).coerceAtLeast(0))
