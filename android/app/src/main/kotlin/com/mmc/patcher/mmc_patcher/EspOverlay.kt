@@ -117,6 +117,12 @@ internal class EspOverlay(private val activity: MainActivity) {
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val player = origin
+            if (player != null) {
+                dotPaint.color = Color.CYAN
+                canvas.drawCircle(player.first, player.second, 6f, dotPaint)
+                canvas.drawLine(player.first - 14f, player.second, player.first + 14f, player.second, dotPaint)
+                canvas.drawLine(player.first, player.second - 14f, player.first, player.second + 14f, dotPaint)
+            }
             for ((t, p) in worldPoints) {
                 if (p.first < -100f || p.first > width + 100f || p.second < -100f || p.second > height + 100f) continue
 

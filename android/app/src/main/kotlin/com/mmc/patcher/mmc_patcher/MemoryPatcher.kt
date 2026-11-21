@@ -52,13 +52,12 @@ internal object MemoryPatcher {
     private const val SCRATCH = 0x13f4000L
     private const val LOS_SLOT = 0x13f4700L
     private const val JOYPAD_SLOT = 0x13f4780L
-    private const val CAN_SEE_TARGET = 0x619e2cL
-    private const val FAKE_GETTER = 0xd97ee8L
+    private const val MAP_MANAGER_GLOBAL = 0x13be02c0L
     private const val FIRE_ANGLE = 0x6888f0L
 
     // Assembled with NDK clang from cave.s (BL cave; RET; <clear>; <blocked>; NOP; NOP).
-    private val STUB_HEX = "74 D0 24 94 C0 03 5F D6 00 00 00 00 00 00 00 00 1F 20 03 D5 1F 20 03 D5"
-    private val CAVE_HEX = "FFC300D1FD7B02A9F35301A9F3031EAA34040058730214CB300400581002138B000200F9100400581002138B100240F9500100B4100240F9100100B4900300581002138BE00310AA710300583102138B20023FD60200001420008052100300581002138B00020039F00200581002138B1112009160000034000240BD02000014200240BDF35341A9FD7B42A9FFC30091C0035FD6F48868000000000080473F0100000000F80D3C010000000000403F01000000002C9E61000000000000473F0100000000F888680000000000"
+    private val STUB_HEX = "74D0249468000010000140BDC0035FD6000000001F2003D5"
+    private val CAVE_HEX = "F0031EAAD1000058100211CBD20000585202108B400200F9C0035FD6F48868000000000080473F0100000000"
 
     private val originals = HashMap<Long, ByteArray>()
     private var comboThread: Thread? = null
@@ -316,12 +315,6 @@ internal object MemoryPatcher {
         }
         if (!writeBytes(pid, base + CAVE, hexToBytes(CAVE_HEX))) return false
         if (!writeBytes(pid, stubAddr, hexToBytes(STUB_HEX))) return false
-
-        // Fake Enemy object: vptr -> fake vtable -> cpSegmentShapeGetA.
-        val s = base + SCRATCH
-        writeLong(pid, s, s + 0x200)
-        writeLong(pid, s + 0x200 + 0x358, base + FAKE_GETTER)
-        writeFloat(pid, s + 0x180, 100000f) // sight range
         return true
     }
 
@@ -330,20 +323,33 @@ internal object MemoryPatcher {
         writeBytes(pid, base + FIRE_ANGLE, original)
     }
 
-    /** Write segment endpoints into the fake Enemy and return whether the path is clear. */
+    /** Pure-memory terrain check: sample the tilemap along the segment. */
     private fun castLos(pid: Int, base: Long, from: Pair<Double, Double>, to: EspTarget): Boolean {
-        val s = base + SCRATCH
-        writeDouble(pid, s + 0x80, from.first)
-        writeDouble(pid, s + 0x88, from.second)
-        writeDouble(pid, s + 0x160, to.x)
-        writeDouble(pid, s + 0x168, to.y)
-        // The game thread evaluates this on its next getFireAngle call (~16 ms).
-        try {
-            Thread.sleep(24)
-        } catch (_: InterruptedException) {
-            // Ignore.
+        val mgr = readLong(pid, base + MAP_MANAGER_GLOBAL) ?: return true
+        val layer = readLong(pid, mgr + 0x50) ?: return true
+        val tiles = readLong(pid, layer + 0x150) ?: return true
+        val mapW = readInt(pid, mgr + 0x98) ?: return true
+        val mapH = readInt(pid, mgr + 0x9c) ?: return true
+        val tw = readFloat(pid, layer + 0x148) ?: return true
+        val th = readFloat(pid, layer + 0x14c) ?: return true
+        if (tw <= 0f || th <= 0f || mapW <= 0 || mapH <= 0) return true
+
+        fun solid(x: Double, y: Double): Boolean {
+            val tx = Math.floor(x / tw).toInt()
+            val ty = Math.floor(y / th).toInt()
+            if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) return false
+            val gid = readInt(pid, tiles + (tx + ty * mapW) * 4L) ?: return false
+            return gid > 0
         }
-        return readBytes(pid, base + LOS_SLOT, 1)?.firstOrNull() == 1.toByte()
+
+        val dx = to.x - from.first
+        val dy = to.y - from.second
+        val steps = (hypot(dx, dy) / (tw / 2)).toInt().coerceAtMost(256)
+        for (i in 1 until steps) {
+            val t = i.toDouble() / steps
+            if (solid(from.first + dx * t, from.second + dy * t)) return false
+        }
+        return true
     }
 
     private fun findJoypad(pid: Int, base: Long): Long? {
@@ -434,13 +440,9 @@ internal object MemoryPatcher {
                         lastAimDeg = deg
                         if (aimEnabled) {
                             zeroSway(p, lc!!)
-                            // Clear angle at stub+8, blocked fallback at stub+12.
-                            writeFloat(p, stub + 8, deg)
-                            writeFloat(p, stub + 12, baseAngle)
+                            writeFloat(p, stub + 16, deg)
                         } else {
-                            val fallback = live ?: baseAngle
-                            writeFloat(p, stub + 8, fallback)
-                            writeFloat(p, stub + 12, fallback)
+                            writeFloat(p, stub + 16, live ?: baseAngle)
                         }
                         val aligned = !triggerEnabled || aimEnabled || angleDiff(deg, live ?: deg) < 12f
                         if (aligned) {
@@ -450,12 +452,11 @@ internal object MemoryPatcher {
                             selectedTarget = null
                             lastLosClear = false
                         }
+                        writeBytes(p, b + LOS_SLOT, byteArrayOf(if (lastLosClear) 1 else 0))
                     } else {
                         selectedTarget = null
                         lastLosClear = false
-                        val fallback = live ?: baseAngle
-                        writeFloat(p, stub + 8, fallback)
-                        writeFloat(p, stub + 12, fallback)
+                        writeFloat(p, stub + 16, live ?: baseAngle)
                     }
 
                     if (triggerEnabled && joypad != null && selectedTarget != null && lastLosClear) {
@@ -522,7 +523,12 @@ internal object MemoryPatcher {
         sb.appendLine("playerProjected(1548x718)=${proj?.first?.toInt()},${proj?.second?.toInt()}")
         val lc = localController(pid, base)
         sb.appendLine("localCtrl=${hex(lc)} pos=${localPosition(pid, base)?.first?.toInt()},${localPosition(pid, base)?.second?.toInt()}")
-        sb.appendLine("targets=${collectTargets(pid, base).size} selected=${selectedTarget?.kind} aim=${lastAimDeg.toInt()}")
+        val tList = collectTargets(pid, base)
+        sb.appendLine("targets=${tList.size} selected=${selectedTarget?.kind} aim=${lastAimDeg.toInt()}")
+        for (t in tList.take(3)) {
+            val p = projectWorld(pid, base, t.x, t.y, 1548, 718)
+            sb.appendLine("  tgt ${t.kind} ${t.x.toInt()},${t.y.toInt()} -> ${p?.first?.toInt()},${p?.second?.toInt()}")
+        }
         sb.appendLine("LOS(1=clear)=${readBytes(pid, base + LOS_SLOT, 1)?.firstOrNull()} joypad=${hex(findJoypad(pid, base))}")
         sb.appendLine("aim=$aimEnabled trigger=$triggerEnabled cave=${hex(readLong(pid, base + FIRE_ANGLE))}")
         return sb.toString()
