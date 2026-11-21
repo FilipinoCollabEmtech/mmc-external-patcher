@@ -59,13 +59,24 @@ internal object PatchLogger {
         synchronized(events) { events.forEach { sb.appendLine(it) } }
         sb.appendLine()
         val logcat = readLogcat().lines()
+        val crashBuffer = runCommand(arrayOf("su", "-c", "logcat -b crash -d -t 200"))
+        val tombstone = runCommand(
+            arrayOf("su", "-c", "f=\$(ls -t /data/tombstones/tombstone_* 2>/dev/null | head -1); [ -n \"\$f\" ] && head -120 \"\$f\""),
+        )
+        val evidence = (logcat + crashBuffer.lines() + tombstone.lines())
         val crashPattern = Regex(
-            """FATAL EXCEPTION|signal \d+|SIGSEGV|SIGABRT|SIGBUS|crash_dump|debuggerd|tombstone|backtrace|#\d\d pc|F libc|ANR|Killed process|lowmemorykiller|MMCPatcher""",
+            """FATAL EXCEPTION|signal \d+|SIGSEGV|SIGABRT|SIGBUS|crash_dump|debuggerd|tombstone|backtrace|#\d\d pc|F libc|F DEBUG|ANR|Killed process|lowmemorykiller|MMCPatcher|pid: \d+, tid:""",
             RegexOption.IGNORE_CASE,
         )
-        val highlights = logcat.filter { crashPattern.containsMatchIn(it) }.takeLast(80)
+        val highlights = evidence.filter { crashPattern.containsMatchIn(it) }.takeLast(80)
         sb.appendLine("--- crash highlights ---")
         if (highlights.isEmpty()) sb.appendLine("(none found)") else highlights.forEach { sb.appendLine(it) }
+        sb.appendLine()
+        sb.appendLine("--- crash buffer ---")
+        sb.appendLine(crashBuffer.ifBlank { "(unavailable)" })
+        sb.appendLine()
+        sb.appendLine("--- tombstone ---")
+        sb.appendLine(tombstone.ifBlank { "(unavailable)" })
         sb.appendLine()
         sb.appendLine("--- dmesg tail ---")
         sb.appendLine(readDmesg())
@@ -84,6 +95,14 @@ internal object PatchLogger {
     } catch (e: Exception) {
         log("CLIPBOARD", "copy failed: ${e.message}")
         false
+    }
+
+    private fun runCommand(command: Array<String>): String = try {
+        val process = Runtime.getRuntime().exec(command)
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        output.ifBlank { process.errorStream.bufferedReader().use { it.readText() } }
+    } catch (_: Exception) {
+        ""
     }
 
     private fun readLogcat(): String {
