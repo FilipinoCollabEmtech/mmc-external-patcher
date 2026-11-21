@@ -25,4 +25,8 @@ enum InjectResult {
  */
 int injector_inject(pid_t pid, const char *path);
 
+/* Path-less load: copy the .so bytes into the target, memfd_create there, and
+ * dlopen("/proc/self/fd/<fd>"). Avoids filesystem/SELinux path restrictions. */
+int injector_inject_memfd(pid_t pid, const char *local_so_path);
+
 #endif

@@ -65,10 +65,22 @@ static bool set_regs(pid_t pid, struct user_regs_struct *r) {
 }
 
 /* Region inside the target: payload + literals + path + trap + private stack. */
-static const uintptr_t kRegionSize = 0x10000;
+static const uintptr_t kRegionSize = 0x200000;   /* 2 MB: enough for the full LGL .so */
 static const uintptr_t kPathOff = 0x80;
 static const uintptr_t kPathCapacity = 0x300;
 static const uintptr_t kTrapOff = 0x1000;
+static const uintptr_t kSoOff = 0x10000;         /* ELF bytes live here */
+static const uintptr_t kMemfdNameOff = 0x2000;   /* "mmc\0" */
+
+/* AArch64 raw syscall stub: svc #0; store x0 to result slot; ret. */
+static uint32_t syscall_payload[4] = {
+    0xD4000001u,          /* svc #0 */
+    0,                    /* ldr x9, [pc,#0x0c] - patched below */
+    0xF9000120u,          /* str x0, [x9] */
+    0xD65F03C0u,          /* ret */
+};
+static const uintptr_t kSyscallResultOff = 0x18;
+static const uintptr_t kSyscallLiteralOff = 0x10;
 
 static bool read_word(pid_t pid, uintptr_t addr, uint64_t *out) {
     errno = 0;
@@ -320,7 +332,7 @@ int injector_inject(pid_t pid, const char *path) {
                 er.pc = remote_dlerror;
                 er.regs[30] = rwx + kTrapOff;
                 er.sp = rwx + kRegionSize;
-                if (set_regs(pid, &er) && wait_stop(pid, 5000)) {
+                if (set_regs(pid, &er) && wait_stop(pid, 500)) {
                     struct user_regs_struct after;
                     if (get_regs(pid, &after)) log_remote_string(pid, after.regs[0], "dlerror");
                 }
@@ -338,5 +350,145 @@ restore_and_detach:
     if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1)
         LOGE("PTRACE_DETACH failed: %s", strerror(errno));
     LOGI("inject finished rc=%d", rc);
+    return rc;
+}
+
+/* Remote raw-syscall helper (AArch64: x0-x5 args, x8 syscall number, svc #0). */
+static bool remote_syscall(pid_t pid, const struct user_regs_struct &saved,
+                           uintptr_t rwx, uintptr_t trap,
+                           uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5,
+                           uint64_t *out) {
+    syscall_payload[1] = ldr_literal(9, 0x0C);
+    const uintptr_t result_slot = rwx + kSyscallResultOff;
+    const uint64_t zero = 0;
+    if (!write_mem(pid, rwx, syscall_payload, sizeof(syscall_payload)) ||
+        !write_mem(pid, rwx + kSyscallLiteralOff, &result_slot, 8) ||
+        !write_mem(pid, rwx + kSyscallResultOff, &zero, 8)) return false;
+
+    struct user_regs_struct r = saved;
+    r.pc = rwx;
+    r.sp = rwx + kRegionSize;
+    r.regs[30] = trap;
+    r.regs[8] = nr;
+    r.regs[0] = a0; r.regs[1] = a1; r.regs[2] = a2;
+    r.regs[3] = a3; r.regs[4] = a4; r.regs[5] = a5;
+    if (!set_regs(pid, &r)) return false;
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    if (!wait_stop(pid, 5000)) {
+        LOGE("remote syscall %llu did not return", (unsigned long long)nr);
+        return false;
+    }
+    return read_word(pid, result_slot, out);
+}
+
+int injector_inject_memfd(pid_t pid, const char *local_so_path) {
+    if (pid <= 0 || !local_so_path || !*local_so_path) return INJECT_ERR_ARGS;
+    FILE *f = fopen(local_so_path, "rb");
+    if (!f) { LOGE("cannot open %s", local_so_path); return INJECT_ERR_ARGS; }
+    fseek(f, 0, SEEK_END);
+    long size_l = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size_l <= 0 || static_cast<size_t>(size_l) > kRegionSize - kSoOff - 0x1000) {
+        fclose(f); return INJECT_ERR_ARGS;
+    }
+    const size_t len = static_cast<size_t>(size_l);
+    const size_t aligned = (len + 7) & ~static_cast<size_t>(7);
+    uint8_t *bytes = static_cast<uint8_t *>(calloc(aligned, 1));
+    if (!bytes || fread(bytes, 1, len, f) != len) { free(bytes); fclose(f); return INJECT_ERR_ARGS; }
+    fclose(f);
+
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { free(bytes); return INJECT_ERR_ATTACH; }
+    int status = 0;
+    if (waitpid(pid, &status, __WALL) != pid) {
+        ptrace(PTRACE_DETACH, pid, 0, 0); free(bytes); return INJECT_ERR_ATTACH;
+    }
+    struct user_regs_struct saved;
+    if (!get_regs(pid, &saved)) {
+        ptrace(PTRACE_DETACH, pid, 0, 0); free(bytes); return INJECT_ERR_GETREGS;
+    }
+
+    void *local_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+    void *local_mmap = dlsym(RTLD_DEFAULT, "mmap");
+    Dl_info di, mi;
+    if (!local_dlopen || !local_mmap ||
+        dladdr(local_dlopen, &di) == 0 || dladdr(local_mmap, &mi) == 0) {
+        ptrace(PTRACE_DETACH, pid, 0, 0); free(bytes); return INJECT_ERR_SYMBOLS;
+    }
+    uintptr_t target_libc = find_lib_base(pid, "/libc.so", false);
+    if (!target_libc) {
+        ptrace(PTRACE_DETACH, pid, 0, 0); free(bytes); return INJECT_ERR_TARGET_LIBC;
+    }
+    uintptr_t remote_dlopen = target_libc +
+        ((uintptr_t)local_dlopen - (uintptr_t)di.dli_fbase);
+    uintptr_t remote_mmap = target_libc +
+        ((uintptr_t)local_mmap - (uintptr_t)mi.dli_fbase);
+
+    int rc = INJECT_ERR_DLOPEN_CALL;
+    uint64_t rwx = 0, fd = 0, written = 0, handle = 0;
+    do {
+        /* mmap via the libc function first: we have no RWX stub yet. */
+        struct user_regs_struct mr = saved;
+        mr.pc = remote_mmap; mr.regs[30] = 0;
+        mr.regs[0] = 0; mr.regs[1] = kRegionSize; mr.regs[2] = 7;
+        mr.regs[3] = 0x22; mr.regs[4] = (uint64_t)-1; mr.regs[5] = 0;
+        if (!set_regs(pid, &mr)) { rc = INJECT_ERR_SETREGS; break; }
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        if (!wait_stop(pid, 5000)) { rc = INJECT_ERR_MMAP; break; }
+        struct user_regs_struct after_map;
+        if (!get_regs(pid, &after_map)) { rc = INJECT_ERR_GETREGS; break; }
+        rwx = after_map.regs[0];
+        if (!rwx || rwx == (uint64_t)-1) { LOGE("memfd: mmap failed"); rc = INJECT_ERR_MMAP; break; }
+        const uintptr_t trap = rwx + kTrapOff;
+        uint64_t trap_insn = 0xD503201FD4200000ULL;
+        if (!write_mem(pid, trap, &trap_insn, 8)) break;
+        if (!write_mem(pid, rwx + kSoOff, bytes, aligned)) break;
+        const char name[] = "mmc\0\0\0\0";
+        if (!write_mem(pid, rwx + kMemfdNameOff, name, 8)) break;
+
+        if (!remote_syscall(pid, saved, rwx, trap, 279 /* memfd_create */,
+                            rwx + kMemfdNameOff, 0, 0, 0, 0, 0, &fd) || !fd) {
+            LOGE("memfd_create failed"); rc = INJECT_ERR_RWX; break;
+        }
+        LOGI("memfd fd=%llu", (unsigned long long)fd);
+        if (!remote_syscall(pid, saved, rwx, trap, 64 /* write */,
+                            fd, rwx + kSoOff, len, 0, 0, 0, &written)) break;
+        if (written != len) { LOGE("memfd write short: %llu/%zu", (unsigned long long)written, len); break; }
+
+        char fdpath[64];
+        snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", static_cast<int>(fd));
+        const size_t path_len = (strlen(fdpath) + 8) & ~static_cast<size_t>(7);
+        if (!write_mem(pid, rwx + kPathOff, fdpath, path_len)) break;
+
+        const uint64_t path_ptr = rwx + kPathOff;
+        const uint64_t dlopen_addr = remote_dlopen;
+        const uint64_t result_slot = rwx + 0x48;
+        const uint64_t zero = 0;
+        const uint32_t payload[8] = {
+            ldr_literal(0, 0x30), 0x52800041u, ldr_literal(8, 0x30),
+            0xD63F0100u, ldr_literal(9, 0x30), 0xF9000120u,
+            0xD65F03C0u, 0xD503201Fu,
+        };
+        if (!write_mem(pid, rwx, payload, sizeof(payload)) ||
+            !write_mem(pid, rwx + 0x30, &path_ptr, 8) ||
+            !write_mem(pid, rwx + 0x38, &dlopen_addr, 8) ||
+            !write_mem(pid, rwx + 0x40, &result_slot, 8) ||
+            !write_mem(pid, rwx + 0x48, &zero, 8)) break;
+
+        struct user_regs_struct r = saved;
+        r.pc = rwx; r.sp = rwx + kRegionSize; r.regs[30] = trap;
+        r.regs[0] = path_ptr; r.regs[1] = 2;
+        if (!set_regs(pid, &r)) break;
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        if (!wait_stop(pid, 15000)) break;
+        if (!read_word(pid, result_slot, &handle)) break;
+        LOGI("memfd dlopen handle=0x%llx", (unsigned long long)handle);
+        rc = handle ? INJECT_OK : INJECT_ERR_DLOPEN_NULL;
+    } while (false);
+
+    if (!set_regs(pid, &saved)) LOGE("SETREGS restore failed");
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    free(bytes);
+    LOGI("memfd inject finished rc=%d", rc);
     return rc;
 }

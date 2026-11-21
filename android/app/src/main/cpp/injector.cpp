@@ -18,3 +18,16 @@ Java_com_mmc_patcher_mmc_1patcher_NativeInjector_nativeInject(
     env->ReleaseStringUTFChars(path, chars);
     return static_cast<jint>(rc);
 }
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_mmc_patcher_mmc_1patcher_NativeInjector_nativeInjectMemfd(
+        JNIEnv *env, jclass clazz, jint pid, jstring path) {
+    (void) clazz;
+    if (!path) return INJECT_ERR_ARGS;
+    const char *chars = env->GetStringUTFChars(path, nullptr);
+    if (!chars) return INJECT_ERR_ARGS;
+    int rc = injector_inject_memfd(static_cast<pid_t>(pid), chars);
+    env->ReleaseStringUTFChars(path, chars);
+    return static_cast<jint>(rc);
+}

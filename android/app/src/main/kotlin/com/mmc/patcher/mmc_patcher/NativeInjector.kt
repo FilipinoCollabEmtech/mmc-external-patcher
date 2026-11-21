@@ -25,6 +25,7 @@ internal object NativeInjector {
 
     private val jniAvailable = runCatching { System.loadLibrary("injector") }.isSuccess
     private external fun nativeInject(pid: Int, path: String): Int
+    private external fun nativeInjectMemfd(pid: Int, path: String): Int
     @Volatile private var appContext: Context? = null
 
     @Volatile var active = false
@@ -198,8 +199,22 @@ internal object NativeInjector {
         }
     }
 
+    /** Path-less load: memfd in the target, then dlopen("/proc/self/fd/N"). */
+    private fun injectMemfd(pid: Int, local: String): InjectResult? {
+        if (!jniAvailable) return null
+        logPrivilegeContext(pid)
+        val rc = nativeInjectMemfd(pid, local)
+        val result = if (rc == 0)
+            InjectResult(true, "loaded $local (memfd)")
+        else
+            InjectResult(false, "memfd rc=$rc (${describe(rc)})")
+        PatchLogger.log(TAG, "ATTEMPT memfd -> ${if (result.ok) "OK" else result.detail}")
+        return result
+    }
+
     /** Try every candidate in one run and report which one works. */
     private fun loadSo(pid: Int, local: String, destName: String): InjectResult {
+        injectMemfd(pid, local)?.let { if (it.ok) return it }
         val attempts = mutableListOf<Pair<String, InjectResult>>()
         fun tryPath(name: String, path: String): InjectResult? {
             val result = inject(pid, path)
