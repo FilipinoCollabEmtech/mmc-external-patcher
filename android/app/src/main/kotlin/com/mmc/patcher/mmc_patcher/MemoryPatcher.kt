@@ -43,17 +43,18 @@ internal object MemoryPatcher {
 
     /** Mirrors the maps scan: first mapping line containing the library name. */
     fun findModuleBase(pid: Int, lib: String = TARGET_LIB): Long? {
+        var result: Long? = null
         try {
             File("/proc/$pid/maps").forEachLine { line ->
-                if (line.contains(lib)) {
+                if (result == null && line.contains(lib)) {
                     val dash = line.indexOf('-')
-                    if (dash > 0) return line.substring(0, dash).toLong(16)
+                    if (dash > 0) result = line.substring(0, dash).toLong(16)
                 }
             }
         } catch (_: Exception) {
             // Unreadable maps.
         }
-        return null
+        return result
     }
 
     private fun hexToBytes(hex: String): ByteArray {
