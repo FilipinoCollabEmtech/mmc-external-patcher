@@ -228,11 +228,11 @@ internal object MemoryPatcher {
 
             val patch = ByteArray(24)
             // adr x8, #12
-            patch[0] = 0x68; patch[1] = 0x00; patch[2] = 0x00; patch[3] = 0x10
+            patch[0] = 0x68.toByte(); patch[1] = 0x00.toByte(); patch[2] = 0x00.toByte(); patch[3] = 0x10.toByte()
             // ldr s0, [x8]
-            patch[4] = 0x00; patch[5] = 0x01; patch[6] = 0x40; patch[7] = 0xBD
+            patch[4] = 0x00.toByte(); patch[5] = 0x01.toByte(); patch[6] = 0x40.toByte(); patch[7] = 0xBD.toByte()
             // ret
-            patch[8] = 0xC0; patch[9] = 0x03; patch[10] = 0x5F; patch[11] = 0xD6
+            patch[8] = 0xC0.toByte(); patch[9] = 0x03.toByte(); patch[10] = 0x5F.toByte(); patch[11] = 0xD6.toByte()
             // NOP padding
             for (i in 16 until 24) {
                 patch[i] = when (i % 4) {
