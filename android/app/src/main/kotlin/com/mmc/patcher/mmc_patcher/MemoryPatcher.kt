@@ -1608,6 +1608,62 @@ internal object MemoryPatcher {
     private const val GRENADE_MAX_RANGE = 1600.0
     private const val GRENADE_COOLDOWN_MS = 1500L
 
+    // ---- true auto grenade: call throwDual from UPDATE, never from getFireAngle ----
+    // RE evidence (cocos2dcpp_disasm.txt / ELF relocations):
+    //   SoldierLocalController::updateStep 0x8e4d5c (disasm:1135605) opens with
+    //   `str x28, [sp, #-0x20]!`. It is a per-frame UPDATE member function and x0 at
+    //   entry is `this` - the local controller - which is throwDual's only argument.
+    //   ELF .rela.dyn: ZTV22SoldierLocalController+0x10 (vptr 0x1352e00) slot +0x4f8
+    //   resolves to _ZN22SoldierLocalController9throwDualEv (0x8edf34); slot +0x480
+    //   resolves to getFireAngle (0x8e6858 -> SoldierView::getFiringAngle), and slot
+    //   +0x618 resolves to getGrenadeCount (0x8edea4).
+    //   The manual path HUD::onPressGrenadeButton 0x66aa9c -> onGrenade 0x667858 ->
+    //   vptr+0x4f8 runs on the GLThread in the update/event phase. Hooking updateStep
+    //   puts our call in that same phase, so it never touches the DRAW path that
+    //   killed the seven render/label caves. Entering at getFireAngle instead would
+    //   re-enter the cave on both of throwDual's getFireAngle calls (0x8ee068,
+    //   0x8ee210); entering at updateStep cannot, because neither call reaches it.
+    private const val GREN_HOOK_OFFSET = 0x8e4d5cL
+    private const val GREN_HOOK_ORIG_HEX = "FC0F1EF8"      // str x28, [sp, #-0x20]!
+    private const val GREN_HOOK_BRANCH_HEX = "E56FF017"    // b 0x500cf0 from 0x8e4d5c
+    private const val GREN_CODE_OFFSET = 0x500cf0L         // .plt/.text gap, after joypad stub (ends 0x500ce8)
+    private const val GREN_DATA_OFFSET = 0x500eb0L         // after LOS data (0x500e00 + 0xa0)
+    private const val GREN_CODE_SIZE = 0x108
+    private const val GREN_DATA_SIZE = 0x40
+    private const val GREN_THROW_DUAL_OFFSET = 0x8edf34L
+    private const val GREN_D_FLAGS = 0x00
+    private const val GREN_D_REENTRY = 0x04
+    private const val GREN_D_THROWFN = 0x08
+    private const val GREN_D_EXPECT_VPTR = 0x10
+    private const val GREN_D_ATTEMPTS = 0x18
+    private const val GREN_D_BADVPTR = 0x20
+    private const val GREN_F_ARM = 1
+    private const val GREN_F_INTHROW = 2
+    private const val LC_GRENADE_ARRAY = 0x2c8L            // getGrenadeCount disasm:1145036
+    private const val CCARRAY_DATA = 0x18L                 // CCArray::count disasm:2026511
+    private const val CCARRAY_OBJECTS = 0x08L              // objectAtIndex disasm:2026547
+
+    // Keystone 0.9.2 / Capstone 5.0.7 assembled at 0x500cf0, disassembled and verified.
+    // Saves x0-x30, arms on flags==1 with a vptr match, sets inThrow, blr throwDual,
+    // clears flags, replays the overwritten `str x28,[sp,#-0x20]!`, returns to 0x8e4d60.
+    private const val GRENADE_STUB_HEX =
+        "FF0304D1E00700A9E20F01A9E41702A9E61F03A9E82704A9EA2F05A9EC3706A9EE3F07A9F04708A9" +
+        "F24F09A9F4570AA9F65F0BA9F8670CA9FA6F0DA9FC770EA9FE7F0FA9" +
+        "0900009029C13A912B0140B96C0080526C010C0A9F050071610200540D0040F92E0940F9BF010EEB" +
+        "610100544C0080522C0100B92C0D40F98C0500912C0D00F9300540F900023FD60C0080522C0100B9" +
+        "0A0000142C1140F98C0500912C1100F9060000144B000837040000142C4140F88C0500912C4100F8" +
+        "E00740A9E20F41A9E41742A9E61F43A9E82744A9EA2F45A9EC3746A9EE3F47A9F04748A9F24F49A9" +
+        "F4574AA9F65F4BA9F8674CA9FA6F4DA9FC774EA9FE7F4FA9FF030491FC0F1EF8DB8F0F14"
+
+    @Volatile private var grenadeHookInstalled = false
+    @Volatile private var grenadeHookPid = -1
+    @Volatile private var grenadeHookBase = 0L
+    private val grenadeHookSaved = HashMap<Long, ByteArray>()
+    @Volatile private var grenadeDiag = "not installed"
+    @Volatile private var grenadeFailReason = "off"
+    @Volatile private var grenadeCountBefore = -1
+    @Volatile private var grenadeCountAfter = -1
+
     private data class GrenadeArc(
         val angleDeg: Float, val distance: Double, val speed: Double,
         val gravity: Double, val flightSeconds: Double, val reachable: Boolean,
@@ -1664,29 +1720,161 @@ internal object MemoryPatcher {
         return GrenadeArc(deg, d, speed, gravity, t, finite(deg.toDouble()))
     }
 
+    /**
+     * getGrenadeCount() (0x8edea4) sums the CCArray counts of the per-type arrays held
+     * in [lc+0x2c8]. CCArray layout: data pointer at +0x18, count at [data], object
+     * array at [data+8] (CCArray::count 0xc37d04, objectAtIndex 0xc37d6c).
+     */
+    private fun grenadeCountOf(pid: Int, lc: Long): Int? {
+        val arr = readLong(pid, lc + LC_GRENADE_ARRAY) ?: return null
+        if (arr == 0L) return 0
+        val data = readLong(pid, arr + CCARRAY_DATA) ?: return null
+        if (data == 0L) return 0
+        val groups = readInt(pid, data) ?: return null
+        if (groups <= 0 || groups > 64) return 0
+        val objects = readLong(pid, data + CCARRAY_OBJECTS) ?: return null
+        if (objects == 0L) return 0
+        var total = 0
+        for (i in 0 until groups) {
+            val sub = readLong(pid, objects + i * 8L) ?: return null
+            if (sub == 0L) continue
+            val subData = readLong(pid, sub + CCARRAY_DATA) ?: return null
+            if (subData == 0L) continue
+            total += maxOf(0, readInt(pid, subData) ?: 0)
+        }
+        return total
+    }
+
+    /** Writes data, cave code, then the 4-byte branch. Never partially arms on failure. */
+    private fun installGrenadeHook(pid: Int, base: Long): Boolean {
+        if (grenadeHookInstalled && grenadeHookPid == pid && grenadeHookBase == base) return true
+        val hookAddr = base + GREN_HOOK_OFFSET
+        val orig = readBytes(pid, hookAddr, 4)
+        if (orig == null || !orig.contentEquals(hexToBytes(GREN_HOOK_ORIG_HEX))) {
+            grenadeFailReason = "entry bytes: " +
+                (orig?.joinToString(" ") { "%02X".format(it.toInt() and 0xff) } ?: "unreadable")
+            PatchLogger.log("GREN", "install FAILED - unexpected updateStep prologue ($grenadeFailReason)")
+            return false
+        }
+        val code = hexToBytes(GRENADE_STUB_HEX)
+        val existing = readBytes(pid, base + GREN_CODE_OFFSET, code.size)
+        if (existing == null || (!existing.contentEquals(code) && !existing.all { it == 0.toByte() })) {
+            grenadeFailReason = "code cave occupied"
+            PatchLogger.log("GREN", "install FAILED - $grenadeFailReason")
+            return false
+        }
+        val d = ByteBuffer.allocate(GREN_DATA_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        d.putInt(GREN_D_FLAGS, 0)
+        d.putInt(GREN_D_REENTRY, 0)
+        d.putLong(GREN_D_THROWFN, base + GREN_THROW_DUAL_OFFSET)
+        d.putLong(GREN_D_EXPECT_VPTR, base + LOCAL_CONTROLLER_VTABLE)
+        d.putLong(GREN_D_ATTEMPTS, 0)
+        d.putLong(GREN_D_BADVPTR, 0)
+        if (!writeBytes(pid, base + GREN_DATA_OFFSET, d.array()) ||
+            !writeBytes(pid, base + GREN_CODE_OFFSET, code) ||
+            !writeBytes(pid, hookAddr, hexToBytes(GREN_HOOK_BRANCH_HEX))
+        ) {
+            // Roll back whatever landed so a half-written hook can never fire.
+            writeBytes(pid, hookAddr, orig)
+            writeBytes(pid, base + GREN_CODE_OFFSET, ByteArray(GREN_CODE_SIZE))
+            grenadeFailReason = "memory write failed"
+            PatchLogger.log("GREN", "install FAILED - $grenadeFailReason (rolled back)")
+            return false
+        }
+        grenadeHookSaved[hookAddr] = orig
+        grenadeHookInstalled = true
+        grenadeHookPid = pid
+        grenadeHookBase = base
+        grenadeFailReason = "-"
+        grenadeDiag = "entry=0x8e4d5c stub=0x500cf0 data=0x500eb0 " +
+            "orig=$GREN_HOOK_ORIG_HEX branch=$GREN_HOOK_BRANCH_HEX"
+        PatchLogger.log("GREN", "hook INSTALLED: $grenadeDiag")
+        return true
+    }
+
+    /** Complete kill switch: branch, cave bytes and data are all restored. */
+    private fun uninstallGrenadeHook(fallbackPid: Int? = null, fallbackBase: Long? = null) {
+        if (!grenadeHookInstalled) return
+        val pid = if (grenadeHookPid > 0) grenadeHookPid else (fallbackPid ?: -1)
+        val base = if (grenadeHookBase != 0L) grenadeHookBase else (fallbackBase ?: 0L)
+        if (pid > 0 && base != 0L) {
+            grenadeHookSaved.remove(base + GREN_HOOK_OFFSET)?.let {
+                writeBytes(pid, base + GREN_HOOK_OFFSET, it)
+            }
+            writeBytes(pid, base + GREN_CODE_OFFSET, ByteArray(GREN_CODE_SIZE))
+            writeBytes(pid, base + GREN_DATA_OFFSET, ByteArray(GREN_DATA_SIZE))
+        }
+        grenadeHookInstalled = false
+        grenadeHookPid = -1
+        grenadeHookBase = 0L
+        grenadeCountBefore = -1
+        grenadeCountAfter = -1
+        grenadeDiag = "uninstalled - all bytes restored"
+        PatchLogger.log("GREN", "hook UNINSTALLED - branch/cave/data restored")
+    }
+
+    /** Publishes the ballistic angle before the one-shot arm so the cave cannot read a stale aim. */
+    private fun armGrenadeThrow(pid: Int, base: Long, angleDeg: Float) {
+        if (!grenadeHookInstalled || grenadeHookBase != base) return
+        writeFloat(pid, base + FIRE_ANGLE_OFFSET + 20, angleDeg)
+        writeBytes(
+            pid,
+            base + GREN_DATA_OFFSET + GREN_D_FLAGS,
+            ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(GREN_F_ARM).array(),
+        )
+        grenadeThrowRequested = true
+    }
+
+    private fun grenadeHookStats(pid: Int, base: Long): String {
+        if (!grenadeHookInstalled) return "not installed ($grenadeFailReason)"
+        val d = base + GREN_DATA_OFFSET
+        val flags = readInt(pid, d + GREN_D_FLAGS)
+        val reentry = readInt(pid, d + GREN_D_REENTRY)
+        val attempts = readLong(pid, d + GREN_D_ATTEMPTS)
+        val badvptr = readLong(pid, d + GREN_D_BADVPTR)
+        val branch = readBytes(pid, base + GREN_HOOK_OFFSET, 4)
+        val branchOk = branch?.contentEquals(hexToBytes(GREN_HOOK_BRANCH_HEX)) == true
+        return "installed=true branch=$branchOk flags=$flags attempts=$attempts " +
+            "reentry=$reentry badvptr=$badvptr orig=$GREN_HOOK_ORIG_HEX branch=$GREN_HOOK_BRANCH_HEX"
+    }
+
     fun toggleAutoGrenade(enable: Boolean): Boolean {
         if (!enable) {
             autoGrenadeEnabled = false
             autoGrenadeThread?.interrupt()
             try { autoGrenadeThread?.join(200) } catch (_: InterruptedException) {}
             autoGrenadeThread = null
-            autoGrenadeArmed = false
-            grenadeThrowRequested = false
+            // Kill switch: stop arming first, then restore every byte we patched.
             grenadeOverrideAngle = Float.NaN
+            grenadeThrowRequested = false
+            val p = findPid()
+            val b = p?.let { findModuleBase(it) }
+            uninstallGrenadeHook(p, b)
+            autoGrenadeArmed = false
+            grenadeCountBefore = -1
+            grenadeCountAfter = -1
             autoGrenadeInfo = "off"
-            PatchLogger.log("GREN", "auto grenade disabled")
+            PatchLogger.log("GREN", "auto grenade disabled - hook removed")
             return true
         }
         if (autoGrenadeEnabled) return true
         val pid = findPid() ?: return false
         val base = findModuleBase(pid) ?: return false
+        // Install before the loop starts: no arm flag can be set without a validated hook.
+        if (!installGrenadeHook(pid, base)) {
+            PatchLogger.log("GREN", "auto grenade NOT enabled - $grenadeFailReason")
+            return false
+        }
         autoGrenadeEnabled = true
         lastGrenadeMs = 0L
-        PatchLogger.log("GREN", "auto grenade armed - aim driven, HUD grenade tap required")
+        grenadeCountBefore = -1
+        grenadeCountAfter = -1
+        PatchLogger.log("GREN", "auto grenade ON - automatic throw via $grenadeDiag")
 
         autoGrenadeThread = Thread {
             var p = pid
             var b = base
+            var lastAttempts = 0L
             while (autoGrenadeEnabled) {
                 // Fail closed every pass; only the armed branch may override aim.
                 grenadeOverrideAngle = Float.NaN
@@ -1700,14 +1888,34 @@ internal object MemoryPatcher {
                     }
                     p = cp
                     b = cb
+                    if (!grenadeHookInstalled || grenadeHookBase != cb) {
+                        // A relaunch destroys the old process; install fresh in the new one.
+                        autoGrenadeArmed = false
+                        if (!installGrenadeHook(cp, cb)) {
+                            autoGrenadeInfo = "hook lost - $grenadeFailReason"
+                            Thread.sleep(200)
+                            continue
+                        }
+                        lastAttempts = 0L
+                    }
 
                     val (gravity, gravitySrc) = grenadeGravityOf(p, b)
                     val lc = writableLocalController(p, b)
                     val origin = lc?.let { soldierPosition(p, it) }
                     val localVel = lc?.let { readLong(p, it + 0x1a8) }
                         ?.let { body -> readVec(p, body + BODY_VEL_X) }
+                    val count = lc?.let { grenadeCountOf(p, it) }
                     val now = System.currentTimeMillis()
-                    var snap = "g=${"%.2f".format(gravity)}[$gravitySrc] no target"
+                    val stats = grenadeHookStats(p, b)
+
+                    // The cave increments this counter immediately after blr throwDual.
+                    val attempts = readLong(p, b + GREN_DATA_OFFSET + GREN_D_ATTEMPTS) ?: lastAttempts
+                    if (attempts > lastAttempts) {
+                        grenadeCountAfter = count ?: -1
+                        lastAttempts = attempts
+                    }
+
+                    var snap = "g=${"%.2f".format(gravity)}[$gravitySrc] nade=$count $stats"
 
                     if (origin != null && sceneStable(p, b)) {
                         val enemies = collectTargets(p, b, withVelocity = true)
@@ -1727,14 +1935,19 @@ internal object MemoryPatcher {
                                 GRENADE_THROW_SPEED, gravity,
                             )
                             val inRange = rawDist <= GRENADE_MAX_RANGE && arc.reachable && visible
-                            if (inRange) {
-                                // Pure memory writes only: the aimlock writer publishes
-                                // this angle every frame, so overriding there avoids a
-                                // write race on the FIRE_ANGLE_OFFSET+20 slot.
+                            val haveGrenade = (count ?: 0) > 0
+                            grenadeFailReason = when {
+                                !haveGrenade -> "no grenades (count=$count)"
+                                !visible -> "LOS blocked"
+                                !arc.reachable -> "arc unreachable d=${"%.0f".format(rawDist)}"
+                                else -> "-"
+                            }
+                            if (inRange && haveGrenade) {
                                 grenadeOverrideAngle = arc.angleDeg
                                 autoGrenadeArmed = true
+                                grenadeCountBefore = count ?: -1
                                 if (now - lastGrenadeMs >= GRENADE_COOLDOWN_MS) {
-                                    grenadeThrowRequested = true
+                                    armGrenadeThrow(p, b, arc.angleDeg)
                                     lastGrenadeMs = now
                                 }
                             } else {
@@ -1742,35 +1955,39 @@ internal object MemoryPatcher {
                             }
                             snap = "crouch=true d=${"%.0f".format(rawDist)} " +
                                 "los=${if (visible) "yes" else "no"} " +
+                                "before=$grenadeCountBefore after=$grenadeCountAfter " +
                                 "ang=${"%.1f".format(arc.angleDeg)} " +
                                 "t=${"%.2f".format(arc.flightSeconds)} " +
-                                "v=${"%.0f".format(arc.speed)} g=${"%.2f".format(gravity)}[$gravitySrc] " +
-                                "armed=$autoGrenadeArmed range=${if (inRange) "pass" else "fail"}"
+                                "g=${"%.2f".format(gravity)}[$gravitySrc] " +
+                                "armed=$autoGrenadeArmed range=${if (inRange) "pass" else "fail"} " +
+                                "reason=${grenadeFailReason} $stats"
                         } else {
                             autoGrenadeArmed = false
-                            snap = "g=${"%.2f".format(gravity)}[$gravitySrc] no crouched nearest " +
-                                "(enemies=${enemies.size} crouched=$duckCount)"
+                            grenadeFailReason = "no crouched nearest (enemies=${enemies.size} crouched=$duckCount)"
+                            snap = "g=${"%.2f".format(gravity)}[$gravitySrc] $grenadeFailReason $stats"
                         }
                     } else {
                         autoGrenadeArmed = false
-                        snap = "g=${"%.2f".format(gravity)}[$gravitySrc] paused - scene/controller"
+                        grenadeFailReason = "scene/controller not writable"
+                        snap = "g=${"%.2f".format(gravity)}[$gravitySrc] $grenadeFailReason $stats"
                     }
                     autoGrenadeInfo = snap
                     logPredict("GREN", snap)
                 } catch (t: Throwable) {
                     autoGrenadeArmed = false
-                    autoGrenadeInfo = "loop: ${t.message}"
+                    grenadeFailReason = "loop: ${t.message}"
+                    autoGrenadeInfo = grenadeFailReason
                     PatchLogger.log("GREN", "loop: ${t.message}")
                 }
                 Thread.sleep(32)
             }
             autoGrenadeArmed = false
             grenadeOverrideAngle = Float.NaN
-        }.apply { isDaemon = true; start() }
+        }.apply { isDaemon = true; name = "auto-grenade"; start() }
         return true
     }
 
-    /** Set by the arming loop; the UI can consume it to drive the HUD grenade tap. */
+    /** Arms request flag set by [armGrenadeThrow]; retained for compatibility/telemetry. */
     fun consumeGrenadeThrowRequest(): Boolean {
         val v = grenadeThrowRequested
         grenadeThrowRequested = false
@@ -1946,6 +2163,10 @@ internal object MemoryPatcher {
         sb.appendLine("GRENADE: enabled=$autoGrenadeEnabled armed=$autoGrenadeArmed " +
             "speed=${f1(GRENADE_THROW_SPEED)} fuse=${f1(GRENADE_FUSE_SECONDS)} " +
             "g=${"%.2f".format(grenGravity)}[$grenSrc] $autoGrenadeInfo")
+        sb.appendLine("GREN HOOK: ${grenadeHookStats(pid, base)}")
+        sb.appendLine("GREN CAVE: $grenadeDiag")
+        sb.appendLine("GREN COUNT: before=$grenadeCountBefore after=$grenadeCountAfter " +
+            "requested=$grenadeThrowRequested reason=$grenadeFailReason")
         players.take(8).forEach { ctrl ->
             val flag = readBytes(pid, ctrl + CTRL_DUCKED, 1)?.get(0)?.toInt()
             val shape = readInt(pid, ctrl + CTRL_DUCKED_SHAPE)
