@@ -730,9 +730,11 @@ internal object MemoryPatcher {
             PatchLogger.log("LOS", "enable aimlock first")
             return false
         }
-        val saved = readBytes(pid, base + LOS_CODE_OFFSET, 4)
-        if (saved == null || !saved.all { it == 0.toByte() }) {
-            PatchLogger.log("LOS", "LOS cave not empty")
+        val engine = hexToBytes(LOS_ENGINE_HEX)
+        val existing = readBytes(pid, base + LOS_CODE_OFFSET, 4)
+        val ours = existing != null && existing.contentEquals(engine.copyOfRange(0, 4))
+        if (existing == null || (!ours && !existing.all { it == 0.toByte() })) {
+            PatchLogger.log("LOS", "LOS cave occupied by unknown bytes")
             return false
         }
         val stub = hexToBytes(LOS_BRANCH_HEX)
@@ -754,7 +756,7 @@ internal object MemoryPatcher {
         repeat(5) { data.putLong(0) }        // pad to 0x80
         repeat(4) { data.putLong(0) }        // 32-byte zeroed query info
         if (!writeBytes(pid, base + LOS_DATA_OFFSET, data.array())) return false
-        if (!writeBytes(pid, base + LOS_CODE_OFFSET, hexToBytes(LOS_ENGINE_HEX))) return false
+        if (!writeBytes(pid, base + LOS_CODE_OFFSET, engine)) return false
         if (!writeBytes(pid, address, stub)) return false
         losSaved[address] = prev
         losActive = true
@@ -788,6 +790,11 @@ internal object MemoryPatcher {
         losActive = false
         val address = base + FIRE_ANGLE_OFFSET
         losSaved.remove(address)?.let { writeBytes(pid, address, it) }
+        // Clear our own cave so a later toggle can install cleanly.
+        runCatching {
+            writeBytes(pid, base + LOS_CODE_OFFSET, ByteArray(hexToBytes(LOS_ENGINE_HEX).size))
+            writeBytes(pid, base + LOS_DATA_OFFSET, ByteArray(0xa0))
+        }
         PatchLogger.log("LOS", "uninstalled")
     }
 
