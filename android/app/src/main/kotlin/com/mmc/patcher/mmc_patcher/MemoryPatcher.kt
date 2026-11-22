@@ -134,8 +134,14 @@ internal object MemoryPatcher {
     private const val LOS_JOYPTR_SLOT = 0x58L
     private const val JOYPTR_BRANCH_HEX = "35000014"
     private const val JOYPTR_STUB_HEX = "E00300F909000090202D07F9C9FFFF17"
-    private const val TRIGGER_COOLDOWN_MS = 120L
-    private const val TRIGGER_HOLD_MS = 40L
+    // Joypad::fire() (0x688e14) samples the byte at +0x18a with `and #1` once per
+    // frame. At 30 FPS a 40 ms pulse can fall entirely between two samples, and
+    // the game's own touch handlers write the same byte (disasm:508552 / 508647).
+    // Keep the byte asserted every tick while a shot is pending instead.
+    private const val TRIGGER_COOLDOWN_MS = 150L
+    private const val TRIGGER_HOLD_MS = 100L   // >= 3 frames at 30 FPS
+    private const val TRIGGER_MAX_HOLD_MS = 320L
+    private const val AIM_TARGET_MATCH_RADIUS = 40.0  // cocos points
 
     @Volatile private var triggerRunning = false
     private var triggerThread: Thread? = null
@@ -143,7 +149,14 @@ internal object MemoryPatcher {
     private val joyPtrSaved = HashMap<Long, ByteArray>()
     private var savedFireState: Byte? = null
     private var lastFireMs = 0L
+    private var fireStartMs = 0L
     private var firePulled = false
+    @Volatile private var trigFireWrites = 0L
+    @Volatile private var trigReleaseWrites = 0L
+    @Volatile private var trigSuccessCount = 0L
+    @Volatile private var trigLastReason = "-"
+    @Volatile private var trigLosSource = "-"
+    @Volatile private var trigTargetKey = "-"
     private const val LOS_ENGINE_HEX =
         "ffc300d1e00300f9fe1700f9f3d300a9f55b01a9f7e301a9530f0010782a40f9e00313aa00cc7492010084d2e20080d200033fd6740240b9d4030034601240bd0020201e66030054740640f915bf81d29527a0f2956a75f8d50200b4b50240f9950200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9a00000b534008052740600b9601240bd0500001414008052740600b9f70340f9e08241bdf7e341a9f55b41a9f3d340a9fe1740f9ffc30091c0035fd6"
 
@@ -499,11 +512,21 @@ internal object MemoryPatcher {
         // Multiplayer / LAN players: *(*(base+0x13bf260))
         for (ctrl in dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)) {
             if (!seen.add(ctrl)) continue
-            // One pread covers teamId(+0x144) and body pointer(+0x1a8).
-            val blk = readBytes(pid, ctrl + TEAM_ID_OFFSET, 0x6c) ?: continue
-            val bb = ByteBuffer.wrap(blk).order(ByteOrder.LITTLE_ENDIAN)
-            val team = bb.getInt(0)
-            val body = bb.getLong(0x64)
+            // One pread covers teamId(+0x144) and body pointer(+0x1a8). A failed
+            // combined read must not discard an otherwise valid player: retry the
+            // two fields separately before giving up.
+            val blk = readBytes(pid, ctrl + TEAM_ID_OFFSET, 0x6c)
+            val team: Int
+            val body: Long
+            if (blk != null && blk.size >= 0x6c) {
+                val bb = ByteBuffer.wrap(blk).order(ByteOrder.LITTLE_ENDIAN)
+                team = bb.getInt(0)
+                body = bb.getLong(0x64)
+            } else {
+                // Keep the team check strict: never fail open on an unreadable team.
+                team = readInt(pid, ctrl + TEAM_ID_OFFSET) ?: continue
+                body = readLong(pid, ctrl + 0x1a8) ?: continue
+            }
             val pos = bodyPosition(pid, body) ?: continue
             val hostile = !teamCheck || isHostile(team, localTeam, KIND_PLAYER)
             val friendly = teamCheck && !hostile
@@ -523,6 +546,8 @@ internal object MemoryPatcher {
         var evx: Double, var evy: Double,
         var ax: Double = 0.0, var ay: Double = 0.0,
         var rvx: Double = 0.0, var rvy: Double = 0.0,
+        var src: String = "-",
+        var stableTicks: Int = 0,
     )
     private val velHistory = ConcurrentHashMap<Long, VelMem>()
 
@@ -556,7 +581,15 @@ internal object MemoryPatcher {
         return readVec(pid, key + FALLBACK_VEL_X)
     }
 
-    /** EMA-smoothed velocity; direct memory field wins unless it is stale/zero while moving. */
+    /**
+     * Source-specific velocity smoothing. The game's own field (cpBody.vel / replicated
+     * velocity) is authoritative and has no finite-difference lag, so it gets a fast EMA.
+     * Blending is done only against a previous sample from the SAME source: a
+     * [mem] -> [diff] switch previously mixed two estimators and injected a spurious
+     * vector into the lead. Acceleration is derived only after the source has been
+     * stable for VEL_STABLE_TICKS and is hard-capped; its lead contribution is gated
+     * separately by LEAD_ACCEL_GAIN so a 16 ms derivative cannot dominate a 1.5 s lead.
+     */
     private fun attachVelocity(
         pid: Int, base: Long, key: Long, kind: Int, isPlayer: Boolean, t: EspTarget,
     ) {
@@ -578,28 +611,33 @@ internal object MemoryPatcher {
         val diffSpeed = diff?.let { hypot(it.first, it.second) } ?: -1.0
         // A zero replicated field with a visibly moving target means the field is stale.
         val useDirect = direct != null && (directSpeed > 1.0 || diffSpeed < 0.0 || diffSpeed < 2.0)
+        val src = if (useDirect) "mem" else if (diff != null) "diff" else "hold"
         val raw = when {
             useDirect -> direct
             diff != null -> diff
             else -> prev?.let { it.evx to it.evy } ?: (0.0 to 0.0)
         }
-        val evx = if (prev != null) prev.evx + VEL_EMA * (raw.first - prev.evx) else raw.first
-        val evy = if (prev != null) prev.evy + VEL_EMA * (raw.second - prev.evy) else raw.second
-        // Acceleration from the change in resolved velocity; clamp so a velocity-source
-        // switch (mem -> diff) cannot inject a spike into the lead prediction.
+
+        val sameSource = prev != null && prev.src == src
+        val alpha = if (useDirect) VEL_EMA else DIFF_EMA
+        val evx = if (sameSource) prev.evx + alpha * (raw.first - prev.evx) else raw.first
+        val evy = if (sameSource) prev.evy + alpha * (raw.second - prev.evy) else raw.second
+        val stable = if (sameSource) (prev.stableTicks + 1).coerceAtMost(VEL_STABLE_TICKS) else 0
+
         val dt = (now - (prev?.t ?: now)).toDouble() / 1000.0
         val ax: Double
         val ay: Double
-        if (prev != null && dt in 0.008..0.25) {
+        if (sameSource && stable >= VEL_STABLE_TICKS && dt in 0.008..0.25) {
             val dax = ((raw.first - prev.rvx) / dt).coerceIn(-MAX_ACCEL, MAX_ACCEL)
             val day = ((raw.second - prev.rvy) / dt).coerceIn(-MAX_ACCEL, MAX_ACCEL)
             ax = ACCEL_EMA * dax + (1.0 - ACCEL_EMA) * prev.ax
             ay = ACCEL_EMA * day + (1.0 - ACCEL_EMA) * prev.ay
         } else {
-            ax = prev?.ax ?: 0.0
-            ay = prev?.ay ?: 0.0
+            // Never carry acceleration across a source switch: that is the over-lead spike.
+            ax = if (sameSource) prev.ax else 0.0
+            ay = if (sameSource) prev.ay else 0.0
         }
-        velHistory[key] = VelMem(t.x, t.y, now, evx, evy, ax, ay, raw.first, raw.second)
+        velHistory[key] = VelMem(t.x, t.y, now, evx, evy, ax, ay, raw.first, raw.second, src, stable)
         if (velHistory.size > 128) {
             val it = velHistory.entries.iterator()
             while (it.hasNext()) if (now - it.next().value.t > 2000L) it.remove()
@@ -608,7 +646,7 @@ internal object MemoryPatcher {
         t.vy = evy
         t.ax = ax
         t.ay = ay
-        t.velSrc = if (useDirect) "mem" else if (diff != null) "diff" else "hold"
+        t.velSrc = src
     }
 
     // ---- ESP camera ----
@@ -753,15 +791,62 @@ internal object MemoryPatcher {
     // HawkDrone::getBodyVelocity fallback at 0x677388 (disasm:490905-490908).
     private const val FALLBACK_VEL_X = 0x1d8L
     private const val FALLBACK_VEL_Y = 0x1e0L
-    // Weapon::getDesignFiringPoint 0x948eb8 loads a stored muzzle offset from
-    // [weapon+0x2d0]/[weapon+0x2d8] (disasm:1239650) then composes node transforms.
-    // FILL: deriving the world muzzle externally needs the node transform chain,
-    // so prediction uses the soldier body position as the firing origin.
+    // Weapon::getDesignFiringPoint 0x948eb8 reads a cpVect design muzzle offset from
+    // [weapon+0x2d0]/[weapon+0x2d8] (disasm:1239650), adds CCNode::getPosition()
+    // (weapon vptr+0xa0), then applies nodeToWorldTransform (vptr+0x308) and the
+    // director transform (0x13c0678 -> vptr+0x310). The result is the WORLD firing
+    // point, and ProjectileManager::weaponFired passes it straight to addBullet as
+    // the bullet origin (disasm:902757-902823). Weapon vtable slot +0x670 resolves
+    // to getDesignFiringPoint (ELF .rela.dyn), and SoldierController::getFiringPoint
+    // 0x8e2018 calls that same slot (disasm:1132586).
+    private const val W_FIRE_POINT_X = 0x2d0L
+    private const val W_FIRE_POINT_Y = 0x2d8L
 
+    // The external patcher cannot call getDesignFiringPoint in-process, so the
+    // muzzle-to-body correction is a configurable world-space vector. The two
+    // modes are: a fixed (dx,dy) offset, or the design offset rotated into world
+    // space by the current aim angle. Both need live calibration (see AIM ACCURACY).
+    // FILL: MUZZLE_* values must be calibrated on device by firing at a stationary
+    // target and measuring the systematic miss; see espDebugInfo() AIM ACCURACY.
+    @Volatile var muzzleOffsetX = 0.0
+        private set
+    @Volatile var muzzleOffsetY = 0.0
+        private set
+    @Volatile var muzzleUseDesign = false
+        private set
+    @Volatile private var muzzleDesignScale = 1.0
+
+    fun setMuzzleOffset(dx: Double, dy: Double) {
+        muzzleOffsetX = dx.coerceIn(-500.0, 500.0)
+        muzzleOffsetY = dy.coerceIn(-500.0, 500.0)
+        PatchLogger.log("AIM", "muzzle world offset set dx=${"%.2f".format(muzzleOffsetX)} dy=${"%.2f".format(muzzleOffsetY)}")
+    }
+
+    fun setMuzzleUseDesign(enabled: Boolean, scale: Double = 1.0) {
+        muzzleUseDesign = enabled
+        muzzleDesignScale = scale.coerceIn(0.0, 5.0)
+        PatchLogger.log("AIM", "muzzle design-offset mode=$enabled scale=$muzzleDesignScale")
+    }
+
+    // getBulletSpeed 0x9487f0 returns an int: int[w+0x2b4] * float[w+0x270],
+    // truncated by `fcvtzs w0, s0` (disasm:1239172-1239180). addBullet passes that
+    // int through unchanged to Projectile::reset via weapon vptr+0x5f0
+    // (disasm:904723-904787; vtable slot resolved from ELF .rela.dyn). No scale
+    // factor exists anywhere on the fire path, so the world-unit conversion is 1.0.
+    // FILL: if live traces show a constant lead bias, calibrate this against a
+    // stationary target at a known distance; 1.0 is the disassembly-backed value.
+    private const val BULLET_SPEED_SCALE = 1.0
+
+    // Acceleration derived from 16-33 ms velocity samples is dominated by noise
+    // and source switches ([mem] -> [diff]); the old 1.5 s clamp multiplied that
+    // noise by t^2/2 and produced systematic over-lead. Keep a small, damped term.
+    private const val LEAD_ACCEL_GAIN = 0.0   // FILL: raise only after live A/B test
     private const val MAX_TARGET_SPEED = 5000.0   // cocos points/s; rejects garbage fields
-    private const val VEL_EMA = 0.45              // smoothing on the resolved velocity
-    private const val ACCEL_EMA = 0.30            // smoothing on acceleration derived from velocity
-    private const val MAX_ACCEL = 20000.0         // cocos points/s^2; reject source-switch spikes
+    private const val VEL_EMA = 0.70              // direct game velocity is authoritative: track it fast
+    private const val DIFF_EMA = 0.35             // heavier smoothing for noisy finite differences
+    private const val ACCEL_EMA = 0.15            // heavy damping on the residual acceleration
+    private const val MAX_ACCEL = 2000.0          // cocos points/s^2; hard cap (was 20000)
+    private const val VEL_STABLE_TICKS = 8        // require a stable source before trusting accel
     private const val VEL_MIN_DT_MS = 8L
     private const val VEL_MAX_DT_MS = 250L
     private const val MAX_LEAD_SECONDS = 1.5      // clamp so stale/fast fields cannot explode
@@ -988,14 +1073,61 @@ internal object MemoryPatcher {
         readLong(pid, lc + LC_PRIMARY)?.takeIf { it != 0L }
             ?: readLong(pid, lc + LC_DUAL)?.takeIf { it != 0L }
 
-    /** Weapon::getBulletSpeed 0x9487f0: int [w+0x2b4] x float [w+0x270] (disasm:1239176-1239180). */
+    /** Raw speed product for diagnostics (before sanity filtering). */
+    private fun bulletSpeedRawOf(pid: Int, w: Long): Double {
+        val base = readInt(pid, w + W_SPEED_BASE)?.toDouble() ?: return Double.NaN
+        val mod = readFloat(pid, w + W_SPEED_MOD)?.toDouble() ?: return Double.NaN
+        return base * mod
+    }
+
+    /**
+     * Weapon::getBulletSpeed 0x9487f0: `scvtf s0,w8 ; fmul s0,s0,s1 ; fcvtzs w0,s0`
+     * (disasm:1239176-1239180). The result is an int world-speed passed unchanged
+     * into Projectile::reset (weapon vptr+0x5f0, disasm:904723-904787).
+     * Grenades/EMP expose 1 here; treat that as unusable instead of computing a
+     * fake 1.5 s flight every frame.
+     */
     private fun bulletSpeedOf(pid: Int, w: Long): Double {
-        val base = readInt(pid, w + W_SPEED_BASE)?.toDouble() ?: return 0.0
-        val mod = readFloat(pid, w + W_SPEED_MOD)?.toDouble() ?: return 0.0
-        val v = base * mod
-        // Grenades/EMP expose 1 here; treat that as unusable instead of computing
-        // a fake 1.5 s flight every frame.
-        return if (finite(v) && v in 100.0..100000.0) v else 0.0
+        val base = readInt(pid, w + W_SPEED_BASE) ?: return 0.0
+        val mod = readFloat(pid, w + W_SPEED_MOD) ?: return 0.0
+        // Match the game's float32 multiply + truncation toward zero.
+        val v = (base.toFloat() * mod).toInt().toDouble()
+        return if (finite(v) && v in 100.0..100000.0) v * BULLET_SPEED_SCALE else 0.0
+    }
+
+    /**
+     * Raw cpVect design muzzle offset from Weapon::getDesignFiringPoint
+     * (disasm:1239650: `ldr q0, [x0, #0x2d0]`). Bounded to reject unreadable memory.
+     */
+    private fun designFiringOffsetOf(pid: Int, w: Long): Pair<Double, Double>? {
+        val buf = readBytes(pid, w + W_FIRE_POINT_X, 16) ?: return null
+        val b = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+        val fx = b.getDouble(0)
+        val fy = b.getDouble(8)
+        if (!finite(fx) || !finite(fy) || hypot(fx, fy) > 2000.0) return null
+        return fx to fy
+    }
+
+    /**
+     * Bullets spawn at Weapon::getDesignFiringPoint (weapon vptr+0x670), which
+     * weaponFired passes to addBullet as the projectile origin (disasm:902757-902823).
+     * Prediction from the body centre leaves a constant lateral miss. The game
+     * function cannot be called externally, so apply a configurable world correction:
+     * fixed (dx,dy), or the design offset rotated by the aim angle. FILL-calibrated.
+     */
+    private fun firingOrigin(
+        pid: Int, w: Long?, body: Pair<Double, Double>, refDeg: Float,
+    ): Pair<Double, Double> {
+        if (!muzzleUseDesign) {
+            return body.first + muzzleOffsetX to body.second + muzzleOffsetY
+        }
+        val design = w?.let { designFiringOffsetOf(pid, it) } ?: return body
+        val rad = Math.toRadians(refDeg.toDouble())
+        val c = kotlin.math.cos(rad)
+        val s = kotlin.math.sin(rad)
+        val dx = (design.first * c - design.second * s) * muzzleDesignScale
+        val dy = (design.first * s + design.second * c) * muzzleDesignScale
+        return body.first + dx to body.second + dy
     }
 
     /** Weapon::getRange 0x9485cc: uint16 [w+0x322] x float [w+0x26c] (disasm:1239009-1239013). */
@@ -1014,6 +1146,11 @@ internal object MemoryPatcher {
 
     private data class Lead(
         val x: Double, val y: Double, val seconds: Double, val iterations: Int,
+    )
+
+    /** One trigger candidate with the ray test already resolved for the effective angle. */
+    private data class TrigCandidate(
+        val target: EspTarget, val raw: Double, val lead: Lead, val hit: Boolean,
     )
 
     /** Iterative intercept: t = |target + v*t + a*t^2/2 - origin| / bulletSpeed, lead clamped. */
@@ -1067,7 +1204,28 @@ internal object MemoryPatcher {
         val iterations: Int = 0,
         val gateLimit: Double = 0.0,
         val gatePass: Boolean? = null,
+        // ---- AIM ACCURACY ----
+        val bodyX: Double = 0.0, val bodyY: Double = 0.0,
+        val originX: Double = 0.0, val originY: Double = 0.0,
+        val muzzleSrc: String = "-",
+        val designX: Double = Double.NaN, val designY: Double = Double.NaN,
+        val speedRaw: Double = Double.NaN,
+        val speedScale: Double = BULLET_SPEED_SCALE,
+        val leadX: Double = 0.0, val leadY: Double = 0.0,
+        val validSpeed: Boolean = false,
+        val accelApplied: Boolean = false,
+        val clamped: Boolean = false,
+        // Published by the aim thread so the trigger can reuse its exact target
+        // instead of re-selecting against a different sample of the same list.
+        val targetX: Double = 0.0,
+        val targetY: Double = 0.0,
+        val targetKey: String = "-",
+        val reason: String = "-",
+        val losSource: String = "-",
     )
+    private fun targetKey(t: EspTarget): String =
+        "K${t.kind}@${t.x.toInt()},${t.y.toInt()}" +
+            if (t.ctrl != 0L) "/${java.lang.Long.toHexString(t.ctrl)}" else ""
     @Volatile private var aimPredict = PredictSnapshot()
     @Volatile private var trigPredict = PredictSnapshot()
     private val predictLogMs = ConcurrentHashMap<String, Long>()
@@ -1079,14 +1237,23 @@ internal object MemoryPatcher {
         PatchLogger.log(tag, message)
     }
 
-    /** View sway must be zeroed or bullets fly off-angle even when the reticle is right. */
-    private fun zeroSway(pid: Int, lc: Long) {
+    /**
+     * Zero recoil/sway. Optionally publish the resolved angle into the view's base
+     * firing-angle field: SoldierView::getFiringAngle (0x8fb0ac, disasm:1158685) reads
+     * view+0x2a0 plus the sway/recoil fields at +0x2a4 and +0x298, which Stage's
+     * sight update refreshes from Joypad::getFireAngle. Writing +0x2a0 directly closes
+     * the one-frame window where a bullet could use a stale angle; the joypad getter
+     * override stays the primary hook (it drives the reticle too) and gets the same
+     * value, so tracking behaviour is unchanged.
+     */
+    private fun zeroSway(pid: Int, lc: Long, fireDeg: Float? = null) {
         val view = readLong(pid, lc + 0x150) ?: return
         if (view == 0L) return
         // A scene swap can leave a dangling view pointer; reject it before writing.
         if (readFloat(pid, view + 0x29c)?.let { finite(it.toDouble()) } != true) return
         val zero = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0f).array()
         for (off in longArrayOf(0x298, 0x29c, 0x2a4)) writeBytes(pid, view + off, zero)
+        if (fireDeg != null && finite(fireDeg.toDouble())) writeFloat(pid, view + 0x2a0, fireDeg)
     }
 
     /** Finite angle only when a target exists; NaN means "use the native joystick angle". */
@@ -1096,21 +1263,46 @@ internal object MemoryPatcher {
             logPredict("AIM", "paused - scene settling or invalid controller")
             return Float.NaN
         }
-        zeroSway(pid, lc)
-        val origin = soldierPosition(pid, lc) ?: return Float.NaN
-        losOrigin = origin
+        val body = soldierPosition(pid, lc) ?: return Float.NaN
         val w = activeWeapon(pid, lc)
         val speed = w?.let { bulletSpeedOf(pid, it) } ?: 0.0
+        val speedRaw = w?.let { bulletSpeedRawOf(pid, it) } ?: Double.NaN
         val range = w?.let { effectiveRangeOf(pid, it) } ?: 0.0
+        val validSpeed = speed > 0.0 && finite(speed)
+        val design = w?.let { designFiringOffsetOf(pid, it) }
+
+        val hostiles = collectTargets(pid, base, withVelocity = true).filter { !it.friendly }
+        // Rotation reference for the design-offset muzzle mode: nearest target from
+        // the body. Fixed-offset mode (the default) does not depend on this.
+        val ref = hostiles.minByOrNull { hypot(it.x - body.first, it.y - body.second) }
+        val refRad = if (ref != null) atan2(-(ref.y - body.second), ref.x - body.first) else 0.0
+        val refDeg = (Math.toDegrees(refRad)).toFloat().let { if (it < 0f) it + 360f else it }
+        // Bullets originate at the weapon firing point, not the physics body centre.
+        val origin = firingOrigin(pid, w, body, refDeg)
+
+        zeroSway(pid, lc)
+        losOrigin = origin
         var best = 4000.0
         var found = Float.NaN
-        var snap = PredictSnapshot(weapon = weaponNameOf(pid, w), range = range, speed = speed)
-        for (t in collectTargets(pid, base, withVelocity = true)) {
-            if (t.friendly) continue
+        var snap = PredictSnapshot(
+            weapon = weaponNameOf(pid, w), range = range, speed = speed,
+            bodyX = body.first, bodyY = body.second,
+            originX = origin.first, originY = origin.second,
+            muzzleSrc = if (muzzleUseDesign) "design(rot)" else "fixed",
+            designX = design?.first ?: Double.NaN, designY = design?.second ?: Double.NaN,
+            speedRaw = speedRaw, speedScale = BULLET_SPEED_SCALE,
+            validSpeed = validSpeed, accelApplied = LEAD_ACCEL_GAIN != 0.0,
+        )
+        for (t in hostiles) {
             val rawDist = hypot(t.x - origin.first, t.y - origin.second)
             if (rawDist < 10.0 || rawDist >= best) continue
             best = rawDist
-            val lead = intercept(origin.first, origin.second, t.x, t.y, t.vx, t.vy, t.ax, t.ay, speed)
+            // Invalid stats (EMP/grenade expose speed=1): intercept() returns the
+            // raw target when speed<=0, so no fabricated 1.5 s flight is aimed at.
+            val lead = intercept(
+                origin.first, origin.second, t.x, t.y,
+                t.vx, t.vy, t.ax * LEAD_ACCEL_GAIN, t.ay * LEAD_ACCEL_GAIN, speed,
+            )
             val dx = lead.x - origin.first
             val dy = lead.y - origin.second
             var deg = (atan2(-dy, dx) * 180.0 / Math.PI).toFloat()
@@ -1122,6 +1314,9 @@ internal object MemoryPatcher {
                 targetKind = t.kind, rawDist = rawDist, vx = t.vx, vy = t.vy, velSrc = t.velSrc,
                 ax = t.ax, ay = t.ay, travel = lead.seconds, leadAngle = deg,
                 predictedDist = hypot(dx, dy), iterations = lead.iterations,
+                leadX = lead.x - t.x, leadY = lead.y - t.y,
+                clamped = lead.seconds >= MAX_LEAD_SECONDS - 1e-6,
+                targetX = t.x, targetY = t.y, targetKey = targetKey(t),
             )
         }
         aimPredict = snap
@@ -1131,6 +1326,13 @@ internal object MemoryPatcher {
                 "v=${"%.0f".format(snap.vx)},${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
                 "tt=${"%.3f".format(snap.travel)} lead=${"%.0f".format(snap.predictedDist)} " +
                 "deg=${"%.1f".format(snap.leadAngle)} it=${snap.iterations}")
+        logPredict("AIMACC",
+            "origin=${"%.0f,%.0f".format(origin.first, origin.second)} " +
+                "body=${"%.0f,%.0f".format(body.first, body.second)} " +
+                "muzzle=${snap.muzzleSrc} design=${design?.let { "%.1f,%.1f".format(it.first, it.second) } ?: "-"} " +
+                "speedRaw=${"%.2f".format(speedRaw)} scale=$BULLET_SPEED_SCALE " +
+                "flight=${"%.3f".format(snap.travel)} leadVec=${"%.1f,%.1f".format(snap.leadX, snap.leadY)} " +
+                "valid=$validSpeed clamp=${snap.clamped} accel=$LEAD_ACCEL_GAIN")
         return found
     }
 
@@ -1162,6 +1364,11 @@ internal object MemoryPatcher {
                         val override = grenadeOverrideAngle
                         val angle = if (override.isNaN()) aim else override
                         writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, angle)
+                        // Publish the same angle into the view's firing-angle base so
+                        // bullets (SoldierView::getFiringAngle) cannot lag the reticle
+                        // by one sight-update frame. NaN is left for native control.
+                        val liveLc = localController(p, b)
+                        if (liveLc != null && liveLc != 0L) zeroSway(p, liveLc, angle)
                         writeLosFrame(p, b, angle)
                     }
                     try {
@@ -1331,6 +1538,9 @@ internal object MemoryPatcher {
     val triggerActive: Boolean get() = triggerRunning
 
     fun uninstallLos(pid: Int, base: Long) {
+        // The grenade hook patches updateStep independently of the LOS cave; tear it
+        // down first so disabling Wall Check cannot leave an armed throw behind.
+        if (autoGrenadeEnabled) toggleAutoGrenade(false)
         if (!losActive) return
         if (triggerRunning) toggleTriggerbot(false)
         unpublishJoypadPointer(pid, base)
@@ -1385,13 +1595,18 @@ internal object MemoryPatcher {
     private fun joypadUsable(pid: Int, jp: Long): Boolean {
         if (jp == 0L) return false
         val angle = readFloat(pid, jp + JOY_ANGLE) ?: return false
-        val state = readBytes(pid, jp + JOY_FIRE_STATE, 1)?.get(0)?.toInt() ?: return false
-        return finite(angle.toDouble()) && kotlin.math.abs(angle) < 100000f && (state == 0 || state == 1)
+        if (!finite(angle.toDouble()) || kotlin.math.abs(angle) >= 100000f) return false
+        // Joypad::fire() (0x688e14) reads this byte and masks it with &1, so any
+        // readable value is valid. Restricting it to 0/1 skipped writes whenever
+        // the game used a different encoding while firing.
+        return (readBytes(pid, jp + JOY_FIRE_STATE, 1)?.size ?: 0) == 1
     }
 
     private fun releaseFire(pid: Int, base: Long, jp: Long) {
         val saved = savedFireState ?: return
-        if (joypadUsable(pid, jp)) writeBytes(pid, jp + JOY_FIRE_STATE, byteArrayOf(saved))
+        if (joypadUsable(pid, jp) && writeBytes(pid, jp + JOY_FIRE_STATE, byteArrayOf(saved))) {
+            trigReleaseWrites++
+        }
         firePulled = false
     }
 
@@ -1468,12 +1683,14 @@ internal object MemoryPatcher {
                         if (joy == 0L) joy = joypadPointer(cp, cb) ?: 0L
                         val now = System.currentTimeMillis()
                         var shouldFire = false
+                        var reason = "no-target"
+                        var losSource = "-"
+                        var key = "-"
 
                         val locked = readFloat(cp, cb + FIRE_ANGLE_OFFSET + 20)
                         val native = if (joy != 0L) readFloat(cp, joy + JOY_ANGLE) else null
-                        val angle = if (locked != null && !locked.isNaN()) locked else native
                         val origin = localPosition(cp, cb)
-                        val lc = localController(cp, cb)
+                        val lc = writableLocalController(cp, cb)
                         val w = lc?.let { activeWeapon(cp, it) }
                         val speed = w?.let { bulletSpeedOf(cp, it) } ?: 0.0
                         val range = w?.let { effectiveRangeOf(cp, it) } ?: 0.0
@@ -1491,73 +1708,147 @@ internal object MemoryPatcher {
                             gateLimit = gateLimit,
                         )
 
-                        if (losVisible(cp, cb) == true && origin != null && lc != null &&
-                            angle != null && joy != 0L
-                        ) {
-                            val rad = if (kotlin.math.abs(angle) > 6.283185f)
-                                Math.toRadians(angle.toDouble()) else angle.toDouble()
-                            val dx = kotlin.math.cos(rad)
-                            val dy = -kotlin.math.sin(rad)
-                            val candidates = collectTargets(cp, cb, withVelocity = true)
-                                .filter {
-                                    it.kind == KIND_DRONE || it.kind == KIND_HAWK ||
-                                        it.kind == KIND_WORM || it.kind == KIND_PLAYER
+                        val losState = losVisible(cp, cb)
+                        val aim = aimPredict
+                        val aimLive = aim.targetKind != -1 && finite(aim.targetX) && finite(aim.targetY)
+                        // The cave returns the override (lead) angle only when its segment
+                        // query succeeded (0x500c9c-0x500cbc); otherwise it returns the
+                        // native joystick angle from [Joypad+0x180]. Trace the same ray.
+                        val caveApplied = losState == true && locked != null && !locked.isNaN()
+                        val rayAngle = if (caveApplied) locked else native
+
+                        when {
+                            joy == 0L -> reason = "joy"
+                            rayAngle == null -> reason = "angle"
+                            origin == null || lc == null -> reason = "scene"
+                            else -> {
+                                val a = rayAngle
+                                val rad = if (kotlin.math.abs(a) > 6.283185f)
+                                    Math.toRadians(a.toDouble()) else a.toDouble()
+                                val dx = kotlin.math.cos(rad)
+                                val dy = -kotlin.math.sin(rad)
+                                val candidates = collectTargets(cp, cb, withVelocity = true)
+                                    .filter {
+                                        it.kind == KIND_DRONE || it.kind == KIND_HAWK ||
+                                            it.kind == KIND_WORM || it.kind == KIND_PLAYER
+                                    }
+                                    .map { t ->
+                                        val raw = hypot(t.x - origin.first, t.y - origin.second)
+                                        val lead = intercept(
+                                            origin.first, origin.second, t.x, t.y, t.vx, t.vy, t.ax, t.ay, speed,
+                                        )
+                                        val hw = halfW(t.kind)
+                                        val hh = halfH(t.kind)
+                                        // Aimlock fires at the lead point; manual aim at the raw point.
+                                        val hit = rayHitsBox(
+                                            origin.first, origin.second, dx, dy, t.x, t.y, hw, hh,
+                                        ) || rayHitsBox(
+                                            origin.first, origin.second, dx, dy, lead.x, lead.y, hw, hh,
+                                        )
+                                        TrigCandidate(t, raw, lead, hit)
+                                    }
+                                    .filter { it.raw in 10.0..4000.0 }
+                                // When the cave applied the override, its LOS belongs to the
+                                // aimlock's exact target. Fire at that target, not a different
+                                // one picked from a second sample of the same list. Without
+                                // the override the game fires at the native angle, so pick
+                                // the nearest target actually on that ray (the original
+                                // triggerShoot behavior in Main.cpp:717-777).
+                                val aimMatch = if (aimLive) candidates.firstOrNull {
+                                    hypot(it.target.x - aim.targetX, it.target.y - aim.targetY) <=
+                                        AIM_TARGET_MATCH_RADIUS
+                                } else null
+                                val target = if (caveApplied)
+                                    (aimMatch ?: candidates.minByOrNull { it.raw })
+                                else
+                                    (candidates.filter { it.hit }.minByOrNull { it.raw }
+                                        ?: candidates.minByOrNull { it.raw })
+                                losSource = when {
+                                    !aimLive -> "aim-none"
+                                    target == null -> "no-target"
+                                    aimMatch == null -> "mismatch"
+                                    losState == null -> "unreadable"
+                                    losState == true -> "aimlock"
+                                    else -> "aimlock-blocked"
                                 }
-                                .map { t ->
-                                    val raw = hypot(t.x - origin.first, t.y - origin.second)
-                                    val lead = intercept(
-                                        origin.first, origin.second, t.x, t.y, t.vx, t.vy, t.ax, t.ay, speed,
+                                if (target == null) {
+                                    reason = "no-target"
+                                } else {
+                                    val t = target.target
+                                    val lead = target.lead
+                                    key = targetKey(t)
+                                    val gateDist = hypot(lead.x - origin.first, lead.y - origin.second)
+                                    // Both the live position and the intercept point must be inside
+                                    // the projectile's travel limit, so a lead toward the shooter
+                                    // cannot justify firing at an out-of-range target.
+                                    val inRange = gateDist <= gateLimit && target.raw <= gateLimit
+                                    snap = snap.copy(
+                                        targetKind = t.kind, rawDist = target.raw,
+                                        vx = t.vx, vy = t.vy, velSrc = t.velSrc,
+                                        ax = t.ax, ay = t.ay,
+                                        travel = lead.seconds, predictedDist = gateDist,
+                                        iterations = lead.iterations, gatePass = inRange,
+                                        targetX = t.x, targetY = t.y, targetKey = key,
                                     )
-                                    Triple(t, raw, lead)
-                                }
-                                .filter { it.second in 10.0..4000.0 }
-                            val target = candidates.minByOrNull { it.second }
-                            if (target != null) {
-                                val t = target.first
-                                val lead = target.third
-                                val gateDist = hypot(lead.x - origin.first, lead.y - origin.second)
-                                // Both the live position and the intercept point must be inside
-                                // the projectile's travel limit, so a lead toward the shooter
-                                // cannot justify firing at an out-of-range target.
-                                val inRange = gateDist <= gateLimit && target.second <= gateLimit
-                                snap = snap.copy(
-                                    targetKind = t.kind, rawDist = target.second,
-                                    vx = t.vx, vy = t.vy, velSrc = t.velSrc,
-                                    ax = t.ax, ay = t.ay,
-                                    travel = lead.seconds, predictedDist = gateDist,
-                                    iterations = lead.iterations, gatePass = inRange,
-                                )
-                                if (inRange) {
-                                    val hw = halfW(t.kind)
-                                    val hh = halfH(t.kind)
-                                    // Aimlock fires at the lead point; manual aim at the raw point.
-                                    val rawHit = rayHitsBox(
-                                        origin.first, origin.second, dx, dy, t.x, t.y, hw, hh,
-                                    )
-                                    val leadHit = rayHitsBox(
-                                        origin.first, origin.second, dx, dy, lead.x, lead.y, hw, hh,
-                                    )
-                                    if (rawHit || leadHit) shouldFire = true
+                                    when {
+                                        !inRange -> reason = "range"
+                                        // Only the aimlock target's LOS is meaningful to the
+                                        // cave. A wall on that exact target still blocks fire.
+                                        aimMatch != null && losState != true -> reason = "LOS"
+                                        !target.hit -> reason = "off-ray"
+                                        else -> shouldFire = true
+                                    }
                                 }
                             }
                         }
+                        snap = snap.copy(reason = reason, losSource = losSource, targetKey = key)
                         trigPredict = snap
+                        trigLastReason = reason
+                        trigLosSource = losSource
+                        trigTargetKey = key
                         logPredict("TRIG",
                             "gate=${snap.gatePass ?: false} w=${snap.weapon} range=${"%.0f".format(range)} " +
+                                "raw=${"%.0f".format(snap.rawDist)} " +
                                 "dist=${"%.0f".format(snap.predictedDist)} limit=${"%.0f".format(gateLimit)} " +
-                                "tgt=${snap.targetKind} v=${"%.0f".format(snap.vx)},${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
-                                "tt=${"%.3f".format(snap.travel)} fire=$shouldFire")
+                                "tgt=${snap.targetKind} key=$key v=${"%.0f".format(snap.vx)}," +
+                                "${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
+                                "tt=${"%.3f".format(snap.travel)} los=$losSource reason=$reason " +
+                                "fire=$shouldFire shots=$trigSuccessCount")
 
-                        val saved = savedFireState ?: 0
+                        val curState = if (joy != 0L) readBytes(cp, joy + JOY_FIRE_STATE, 1)?.get(0) else null
                         val joyOk = joypadUsable(cp, joy)
-                        if (shouldFire && joyOk && now - lastFireMs >= TRIGGER_COOLDOWN_MS) {
-                            if (writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(1))) {
-                                lastFireMs = now
-                                firePulled = true
+                        // Track the game's resting value: a respawn or scene swap can
+                        // change it after we captured it at enable time.
+                        if (!firePulled && curState != null && curState != 1.toByte()) savedFireState = curState
+                        val saved = savedFireState ?: 0
+                        when {
+                            joy == 0L || curState == null -> firePulled = false
+                            !firePulled -> {
+                                if (shouldFire && joyOk && now - lastFireMs >= TRIGGER_COOLDOWN_MS &&
+                                    writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(1))
+                                ) {
+                                    firePulled = true
+                                    fireStartMs = now
+                                    lastFireMs = now
+                                    trigFireWrites++
+                                    trigSuccessCount++
+                                    logPredict("TRIGF",
+                                        "pull#$trigSuccessCount key=$key raw=${"%.0f".format(snap.rawDist)} " +
+                                            "pred=${"%.0f".format(snap.predictedDist)} los=$losSource")
+                                }
                             }
-                        } else if (firePulled && joyOk && now - lastFireMs >= TRIGGER_HOLD_MS) {
-                            writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(saved))
-                            firePulled = false
+                            else -> {
+                                // Re-assert every tick. The game writes +0x18a from its
+                                // own touch handlers, so a single 40 ms pulse could be
+                                // cleared before Joypad::fire() sampled it.
+                                if (writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(1))) trigFireWrites++
+                                val held = now - fireStartMs
+                                if ((!shouldFire && held >= TRIGGER_HOLD_MS) || held >= TRIGGER_MAX_HOLD_MS) {
+                                    if (writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(saved))) trigReleaseWrites++
+                                    firePulled = false
+                                    lastFireMs = now
+                                }
+                            }
                         }
                     } catch (t: Throwable) {
                         PatchLogger.log("TRIG", "loop: ${t.message}")
@@ -1604,7 +1895,13 @@ internal object MemoryPatcher {
     private const val GRENADE_THROW_SPEED = 40.0       // disasm:1145286
     private const val GRENADE_FUSE_SECONDS = 1.75      // disasm:416451
     private const val GRAVITY_FACTOR_GLOBAL = 0x13c20a8L // gravityFactor OBJECT, dynsyms line 1976
-    private const val GRENADE_GRAVITY_FALLBACK = 25.0  // FILL: calibrate from live gravityFactor
+    // GameCustomizeLayer::createGravityRow sets the base gravity to 25.0
+    // (disasm:453146 `fmov s0, #25.0`). MapManager::getGravityFactor (0x6dbb94)
+    // returns a MULTIPLIER from [this+0x18] (disasm:595351), not raw gravity.
+    // Using the factor alone produced g=1.0 and a ~9 s flight / near-vertical
+    // throw, which crashed the game on the first attempted grenade.
+    private const val GRENADE_BASE_GRAVITY = 25.0
+    private const val GRENADE_GRAVITY_FALLBACK = GRENADE_BASE_GRAVITY
     private const val GRENADE_MAX_RANGE = 1600.0
     private const val GRENADE_COOLDOWN_MS = 1500L
 
@@ -1678,12 +1975,17 @@ internal object MemoryPatcher {
     private var autoGrenadeThread: Thread? = null
     private var lastGrenadeMs = 0L
 
-    /** Live gravity factor; falls back to a documented default and says so in logs. */
+    /** Effective gravity = base 25.0 x the game's gravityFactor multiplier. */
     private fun grenadeGravityOf(pid: Int, base: Long): Pair<Double, String> {
-        val f = readFloat(pid, base + GRAVITY_FACTOR_GLOBAL)?.toDouble()
-        if (f != null && finite(f) && f in 1.0..5000.0) return f to "factor-f32"
-        val i = readInt(pid, base + GRAVITY_FACTOR_GLOBAL)?.toDouble()
-        if (i != null && finite(i) && i in 1.0..5000.0) return i to "factor-i32"
+        fun fromFactor(v: Double?, tag: String): Pair<Double, String>? {
+            if (v == null || !finite(v) || v !in 0.05..20.0) return null
+            val g = GRENADE_BASE_GRAVITY * v
+            return if (finite(g) && g in 1.0..1000.0) g to tag else null
+        }
+        fromFactor(readFloat(pid, base + GRAVITY_FACTOR_GLOBAL)?.toDouble(), "base25*f32")
+            ?.let { return it }
+        fromFactor(readInt(pid, base + GRAVITY_FACTOR_GLOBAL)?.toDouble(), "base25*i32")
+            ?.let { return it }
         return GRENADE_GRAVITY_FALLBACK to "fallback(FILL)"
     }
 
@@ -2154,11 +2456,34 @@ internal object MemoryPatcher {
             "tgt=${a.targetKind} d=${f1(a.rawDist)} v=${f1(a.vx)},${f1(a.vy)}[${a.velSrc}] " +
             "a=${f1(a.ax)},${f1(a.ay)} tt=${"%.3f".format(a.travel)} lead=${f1(a.predictedDist)} " +
             "deg=${"%.1f".format(a.leadAngle)} it=${a.iterations}")
+        // AIM ACCURACY: every input to the ballistic solution plus the FILL knobs.
+        sb.appendLine("=== AIM ACCURACY ===")
+        sb.appendLine("  origin=${f1(a.originX)},${f1(a.originY)} body=${f1(a.bodyX)},${f1(a.bodyY)} " +
+            "src=${a.muzzleSrc} off=${f1(a.originX - a.bodyX)},${f1(a.originY - a.bodyY)}")
+        sb.appendLine("  design=${a.designX.let { if (finite(it)) "%.1f".format(it) else "-" }}," +
+            "${a.designY.let { if (finite(it)) "%.1f".format(it) else "-" }} " +
+            "w+0x2d0/0x2d8 (weapon-local doubles)")
+        sb.appendLine("  speed=${f1(a.speed)} raw=${a.speedRaw.let { if (finite(it)) "%.2f".format(it) else "-" }} " +
+            "scale=$BULLET_SPEED_SCALE valid=${a.validSpeed} " +
+            "(getBulletSpeed int[0x2b4]*f32[0x270], disasm:1239172)")
+        sb.appendLine("  flight=${"%.3f".format(a.travel)} clamped=${a.clamped} " +
+            "leadVec=${f1(a.leadX)},${f1(a.leadY)} it=${a.iterations} accelGain=$LEAD_ACCEL_GAIN")
+        sb.appendLine("  FILL muzzleFixed=${f1(muzzleOffsetX)},${f1(muzzleOffsetY)} " +
+            "useDesign=$muzzleUseDesign designScale=$muzzleDesignScale - " +
+            "calibrate: setMuzzleOffset(dx,dy) / setMuzzleUseDesign(on,scale)")
+        sb.appendLine("  FILL speedScale=$BULLET_SPEED_SCALE accelGain=$LEAD_ACCEL_GAIN - " +
+            "only raise after live A/B test against a stationary target")
         val g = trigPredict
         sb.appendLine("PREDICT TRIG: w=${g.weapon} range=${f1(g.range)} speed=${f1(g.speed)} " +
             "tgt=${g.targetKind} d=${f1(g.rawDist)} v=${f1(g.vx)},${f1(g.vy)}[${g.velSrc}] " +
             "a=${f1(g.ax)},${f1(g.ay)} tt=${"%.3f".format(g.travel)} lead=${f1(g.predictedDist)} " +
             "limit=${f1(g.gateLimit)} gate=${g.gatePass}")
+        sb.appendLine("TRIG: active=$triggerRunning key=$trigTargetKey " +
+            "raw=${f1(g.rawDist)} pred=${f1(g.predictedDist)} los=$trigLosSource " +
+            "reason=$trigLastReason joy=${hx(joypadPointer(pid, base))} joyOk=${
+                joypadPointer(pid, base)?.let { joypadUsable(pid, it) } ?: false
+            } pulled=$firePulled " +
+            "fireWrites=$trigFireWrites releaseWrites=$trigReleaseWrites shots=$trigSuccessCount")
         val (grenGravity, grenSrc) = grenadeGravityOf(pid, base)
         sb.appendLine("GRENADE: enabled=$autoGrenadeEnabled armed=$autoGrenadeArmed " +
             "speed=${f1(GRENADE_THROW_SPEED)} fuse=${f1(GRENADE_FUSE_SECONDS)} " +
