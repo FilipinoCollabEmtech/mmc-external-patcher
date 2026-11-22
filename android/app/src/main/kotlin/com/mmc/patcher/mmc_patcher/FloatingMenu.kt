@@ -37,6 +37,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var base: Long? = null
     private var debug: DebugOverlay? = null
     private var espDebug: EspDebugOverlay? = null
+    private var espPid: Int? = null
+    private var espBase: Long? = null
+    private var espBoxes = false
+    private var espLines = false
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
     private val states = LinkedHashMap<String, Boolean>()
@@ -113,6 +117,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         icon = null
         panel = null
         expanded = false
+        espPid?.let { p -> espBase?.let { b -> MemoryPatcher.setEspFlags(p, b, false, false) } }
         debug?.hide()
         debug = null
         espDebug?.hide()
@@ -289,7 +294,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         container.addView(groupRow("ammo", "∞", "Infinite Ammo", "Clip and reserve never run dry", PATCH_GROUPS[1]))
         container.addView(groupRow("security", "SH", "Security Bypass", "Hide H4X alerts · ballistics", PATCH_GROUPS[2]))
 
-        container.addView(sectionTitle("AIM  /  WALL CHECK"))
+        container.addView(sectionTitle("AIM  /  WALL CHECK  /  ESP"))
         container.addView(toggleRow("aim", "◎", "Aimlock", "Snap to the nearest enemy") { checked ->
             toggleAimlock(checked)
         })
@@ -316,6 +321,15 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 installed
             }
         })
+        container.addView(toggleRow("espBoxes", "▣", "ESP Boxes", "Outline targets through walls") { checked ->
+            setEsp(boxes = checked)
+            true
+        })
+        container.addView(toggleRow("espLines", "╱", "ESP Lines", "Draw lines to every target") { checked ->
+            setEsp(lines = checked)
+            true
+        })
+
         container.addView(sectionTitle("DIAGNOSTICS"))
         container.addView(toggleRow("debug", "i", "Live Debug Data", "Show pointers and target values") { checked ->
             if (checked) {
@@ -542,6 +556,29 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
         paint()
         return row
+    }
+
+    private fun setEsp(boxes: Boolean? = null, lines: Boolean? = null) {
+        if (boxes != null) espBoxes = boxes
+        if (lines != null) espLines = lines
+        if (!ensureAttached()) {
+            toast("Launch MMC first")
+            return
+        }
+        val p = pid!!
+        val b = base!!
+        if (espPid != p || espBase != b) {
+            if (!MemoryPatcher.installInternalEsp(p, b)) {
+                PatchLogger.log("ESP", "install failed pid=$p base=0x${b.toString(16)}")
+                toast("ESP install failed")
+                return
+            }
+            PatchLogger.log("ESP", "hook installed pid=$p base=0x${b.toString(16)}")
+            espPid = p
+            espBase = b
+        }
+        PatchLogger.log("ESP", "flags boxes=$espBoxes lines=$espLines")
+        MemoryPatcher.setEspFlags(p, b, espBoxes, espLines)
     }
 
     private fun refreshPanel() {
