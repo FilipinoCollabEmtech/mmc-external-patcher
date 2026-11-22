@@ -729,6 +729,68 @@ internal object MemoryPatcher {
         return v == 1
     }
 
+    /** Everything needed to diagnose external-ESP alignment, logged every ~2 s. */
+    fun espAlignmentDebug(pid: Int, base: Long, viewW: Int, viewH: Int): String {
+        fun hx(v: Long?) = v?.let { "0x${it.toString(16)}" } ?: "null"
+        fun n(n: NodeInfo) =
+            "p=${n.px.toInt()},${n.py.toInt()} s=${"%.3f".format(n.sx)},${"%.3f".format(n.sy)} " +
+                "a=${n.ax.toInt()},${n.ay.toInt()} c=${n.cw.toInt()},${n.ch.toInt()}"
+        val sb = StringBuilder()
+        sb.appendLine("=== ESP ALIGN ===")
+        val director = readLong(pid, base + DIRECTOR_GLOBAL)
+        val width = director?.let { readFloat(pid, it + 0xd0) }
+        val height = director?.let { readFloat(pid, it + 0xd4) }
+        val csf = director?.let { readFloat(pid, it + 0xd8) }
+        val scene = director?.let { readLong(pid, it + 0xa0) }
+        sb.appendLine("director=${hx(director)} scene=${hx(scene)} win=${width?.toInt()}x${height?.toInt()} csf=$csf")
+        val w = width ?: 0f
+        val h = height ?: 0f
+        sb.appendLine("view=${viewW}x${viewH} kx=${if (w > 0f) viewW / w else 1f} ky=${if (h > 0f) viewH / h else 1f}")
+        val c = camera(pid, base)
+        sb.appendLine("chosen cam off=${c?.x?.toInt()},${c?.y?.toInt()} scale=${c?.scaleX},${c?.scaleY}")
+
+        if (scene != null && scene != 0L) {
+            var idx1 = 0
+            for (c1 in children(pid, scene)) {
+                if (idx1++ >= 6) break
+                val n1 = nodeInfo(pid, c1) ?: continue
+                sb.appendLine("c1[${idx1 - 1}]=${hx(c1)} ${n(n1)}")
+                var idx2 = 0
+                for (c2 in children(pid, c1)) {
+                    if (idx2++ >= 6) break
+                    val n2 = nodeInfo(pid, c2) ?: continue
+                    val mag = kotlin.math.abs(n2.px) + kotlin.math.abs(n2.py)
+                    sb.appendLine("  c2[${idx2 - 1}]=${hx(c2)} ${n(n2)} mag=${mag.toInt()}")
+                    var idx3 = 0
+                    for (c3 in children(pid, c2)) {
+                        if (idx3++ >= 3) break
+                        val n3 = nodeInfo(pid, c3) ?: continue
+                        sb.appendLine("    c3[${idx3 - 1}]=${hx(c3)} ${n(n3)} mag=${(kotlin.math.abs(n3.px) + kotlin.math.abs(n3.py)).toInt()}")
+                    }
+                }
+            }
+        } else {
+            sb.appendLine("scene missing - cannot walk hierarchy")
+        }
+
+        val kx = if ((c?.width ?: 0f) > 0f) viewW / c!!.width else 1f
+        val ky = if ((c?.height ?: 0f) > 0f) viewH / c!!.height else 1f
+        fun screen(x: Double, y: Double): String {
+            if (c == null) return "no cam"
+            val px = (x.toFloat() * c.scaleX + c.x) * kx
+            val py = (y.toFloat() * c.scaleY + c.y) * ky
+            return "${px.toInt()},${(viewH - py).toInt()}"
+        }
+        val local = localPosition(pid, base)
+        sb.appendLine("local raw=${local?.first?.toInt()},${local?.second?.toInt()} screen=${local?.let { screen(it.first, it.second) }}")
+        var i = 0
+        for (t in collectTargets(pid, base)) {
+            if (i++ >= 8) break
+            sb.appendLine("target kind=${t.kind} raw=${t.x.toInt()},${t.y.toInt()} screen=${screen(t.x, t.y)}")
+        }
+        return sb.toString()
+    }
+
     /** Live readout of every value the in-game ESP engine reads, for debugging. */
     @Suppress("JoinDeclarationAndAssignment")
     fun espDebugInfo(pid: Int, base: Long): String {

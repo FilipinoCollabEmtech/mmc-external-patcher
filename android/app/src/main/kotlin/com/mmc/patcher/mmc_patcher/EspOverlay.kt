@@ -47,6 +47,7 @@ internal class EspOverlay(private val activity: MainActivity) {
         var cachedBase = -1L
         var lastPidCheck = 0L
         var lastBaseCheck = 0L
+        var lastAlignLog = 0L
         thread = Thread {
             while (running) {
                 val now = System.currentTimeMillis()
@@ -70,6 +71,10 @@ internal class EspOverlay(private val activity: MainActivity) {
                     val vh = view?.height ?: activity.resources.displayMetrics.heightPixels
                     origin = localPosition(p, b)?.let { pos ->
                         cam?.let { c -> project(pos.first, pos.second, c, vw, vh) }
+                    }
+                    if (now - lastAlignLog > 2000L) {
+                        lastAlignLog = now
+                        PatchLogger.log("ESPALIGN", MemoryPatcher.espAlignmentDebug(p, b, vw, vh))
                     }
                 }
                 view?.postInvalidate()
