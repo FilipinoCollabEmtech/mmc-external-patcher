@@ -387,6 +387,40 @@ internal object MemoryPatcher {
         return soldierPosition(pid, lc)
     }
 
+    // ---- write safety across scene transitions ---------------------------
+    // Leaving a match for the lobby and rejoining swaps the local controller and
+    // joypad objects. The globals can briefly still hold the freed pointer; writing
+    // into those objects corrupts the game heap (observed as "Invalid address ...
+    // passed to free" in GLThread). Validate the controller vtable and pause all
+    // controller writes while the scene pointer is changing.
+    private const val LOCAL_CONTROLLER_VTABLE = 0x1352e00L // ZTV22SoldierLocalController 0x1352df0 + 0x10
+    private const val SCENE_SETTLE_MS = 1500L
+
+    @Volatile private var lastScene = 0L
+    @Volatile private var sceneSettleUntil = 0L
+
+    private fun sceneStable(pid: Int, base: Long): Boolean {
+        val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return false
+        val scene = readLong(pid, director + 0xa0) ?: return false
+        val now = System.currentTimeMillis()
+        if (scene == 0L) return false
+        if (scene != lastScene) {
+            lastScene = scene
+            sceneSettleUntil = now + SCENE_SETTLE_MS
+            return false
+        }
+        return now >= sceneSettleUntil
+    }
+
+    /** Non-null only for a live SoldierLocalController that is safe to write into. */
+    private fun writableLocalController(pid: Int, base: Long): Long? {
+        if (!sceneStable(pid, base)) return null
+        val lc = localController(pid, base).takeIf { it != 0L } ?: return null
+        val vptr = readLong(pid, lc) ?: return null
+        if (vptr - base != LOCAL_CONTROLLER_VTABLE) return null
+        return lc
+    }
+
     fun collectTargets(pid: Int, base: Long, withVelocity: Boolean = false): List<EspTarget> {
         val out = mutableListOf<EspTarget>()
         val seen = HashSet<Long>()
@@ -779,7 +813,11 @@ internal object MemoryPatcher {
     private fun applyPov(): Boolean {
         val pid = findPid() ?: return false
         val base = findModuleBase(pid) ?: return false
-        val lc = localController(pid, base).takeIf { it != 0L } ?: return false
+        // Never write into a controller that may have been freed by a scene swap.
+        val lc = writableLocalController(pid, base) ?: run {
+            if (povPercent != POV_MIN) logPredict("POV", "write skipped - scene settling or invalid controller")
+            return false
+        }
         val z = povScale
         return writeFloat(pid, lc + POV_LC_FIELD, z) and
             writeFloat(pid, lc + POV_LC_SMOOTH, z) and
@@ -878,7 +916,9 @@ internal object MemoryPatcher {
         val base = readInt(pid, w + W_SPEED_BASE)?.toDouble() ?: return 0.0
         val mod = readFloat(pid, w + W_SPEED_MOD)?.toDouble() ?: return 0.0
         val v = base * mod
-        return if (finite(v) && v in 1.0..100000.0) v else 0.0
+        // Grenades/EMP expose 1 here; treat that as unusable instead of computing
+        // a fake 1.5 s flight every frame.
+        return if (finite(v) && v in 100.0..100000.0) v else 0.0
     }
 
     /** Weapon::getRange 0x9485cc: uint16 [w+0x322] x float [w+0x26c] (disasm:1239009-1239013). */
@@ -886,7 +926,7 @@ internal object MemoryPatcher {
         val base = readU16(pid, w + W_RANGE_BASE)?.toDouble() ?: return 0.0
         val mod = readFloat(pid, w + W_RANGE_MOD)?.toDouble() ?: return 0.0
         val v = base * mod
-        return if (finite(v) && v in 1.0..100000.0) v else 0.0
+        return if (finite(v) && v in 20.0..100000.0) v else 0.0
     }
 
     private fun weaponNameOf(pid: Int, w: Long?): String {
@@ -966,13 +1006,19 @@ internal object MemoryPatcher {
     private fun zeroSway(pid: Int, lc: Long) {
         val view = readLong(pid, lc + 0x150) ?: return
         if (view == 0L) return
+        // A scene swap can leave a dangling view pointer; reject it before writing.
+        if (readFloat(pid, view + 0x29c)?.let { finite(it) } != true) return
         val zero = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0f).array()
         for (off in longArrayOf(0x298, 0x29c, 0x2a4)) writeBytes(pid, view + off, zero)
     }
 
     /** Finite angle only when a target exists; NaN means "use the native joystick angle". */
     private fun aimAngle(pid: Int, base: Long): Float {
-        val lc = localController(pid, base) ?: return Float.NaN
+        // Skip the whole write path while the scene/controller is being replaced.
+        val lc = writableLocalController(pid, base) ?: run {
+            logPredict("AIM", "paused - scene settling or invalid controller")
+            return Float.NaN
+        }
         zeroSway(pid, lc)
         val origin = soldierPosition(pid, lc) ?: return Float.NaN
         losOrigin = origin
@@ -1256,9 +1302,17 @@ internal object MemoryPatcher {
         if (!joyPtrPublished) null
         else readLong(pid, base + LOS_DATA_OFFSET + LOS_JOYPTR_SLOT)?.takeIf { it != 0L }
 
+    /** The cave republishes Joypad* each frame, but after a scene swap it can be stale. */
+    private fun joypadUsable(pid: Int, jp: Long): Boolean {
+        if (jp == 0L) return false
+        val angle = readFloat(pid, jp + JOY_ANGLE) ?: return false
+        val state = readBytes(pid, jp + JOY_FIRE_STATE, 1)?.get(0)?.toInt() ?: return false
+        return finite(angle) && kotlin.math.abs(angle) < 100000f && (state == 0 || state == 1)
+    }
+
     private fun releaseFire(pid: Int, base: Long, jp: Long) {
         val saved = savedFireState ?: return
-        if (jp != 0L) writeBytes(pid, jp + JOY_FIRE_STATE, byteArrayOf(saved))
+        if (joypadUsable(pid, jp)) writeBytes(pid, jp + JOY_FIRE_STATE, byteArrayOf(saved))
         firePulled = false
     }
 
@@ -1346,7 +1400,13 @@ internal object MemoryPatcher {
                         val range = w?.let { effectiveRangeOf(cp, it) } ?: 0.0
                         // Unknown range fails open; known range stops short by a small margin.
                         val margin = if (range > 0.0) maxOf(RANGE_SAFETY_MARGIN, range * RANGE_SAFETY_FRACTION) else 0.0
-                        val gateLimit = if (range > 0.0) maxOf(10.0, range - margin) else 4000.0
+                        // Weapon pointer unreadable -> preserve firing. Weapon present but
+                        // stats invalid (EMP/grenade) -> fail closed instead of 4000 range.
+                        val gateLimit = when {
+                            w == null -> 4000.0
+                            range <= 0.0 -> 0.0
+                            else -> maxOf(10.0, range - margin)
+                        }
                         var snap = PredictSnapshot(
                             weapon = weaponNameOf(cp, w), range = range, speed = speed,
                             gateLimit = gateLimit,
@@ -1410,12 +1470,13 @@ internal object MemoryPatcher {
                                 "tt=${"%.3f".format(snap.travel)} fire=$shouldFire")
 
                         val saved = savedFireState ?: 0
-                        if (shouldFire && now - lastFireMs >= TRIGGER_COOLDOWN_MS) {
+                        val joyOk = joypadUsable(cp, joy)
+                        if (shouldFire && joyOk && now - lastFireMs >= TRIGGER_COOLDOWN_MS) {
                             if (writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(1))) {
                                 lastFireMs = now
                                 firePulled = true
                             }
-                        } else if (firePulled && now - lastFireMs >= TRIGGER_HOLD_MS) {
+                        } else if (firePulled && joyOk && now - lastFireMs >= TRIGGER_HOLD_MS) {
                             writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(saved))
                             firePulled = false
                         }
