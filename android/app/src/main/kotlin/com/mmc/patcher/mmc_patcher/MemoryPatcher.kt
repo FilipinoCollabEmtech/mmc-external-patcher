@@ -812,7 +812,11 @@ internal object MemoryPatcher {
         private set
     @Volatile var muzzleOffsetY = 0.0
         private set
-    @Volatile var muzzleUseDesign = false
+    // Live logs show the design firing point is a small, consistent weapon-local
+    // point (UZI/TEC9/MAGNUM 95,16; SAWGUN 80,15), so use it by default. The
+    // disassembly-proven muzzle origin is otherwise never applied and bullets
+    // fly from the body centre, which is the systematic miss being reported.
+    @Volatile var muzzleUseDesign = true
         private set
     @Volatile private var muzzleDesignScale = 1.0
 
@@ -1122,7 +1126,10 @@ internal object MemoryPatcher {
             return body.first + muzzleOffsetX to body.second + muzzleOffsetY
         }
         val design = w?.let { designFiringOffsetOf(pid, it) } ?: return body
-        val rad = Math.toRadians(refDeg.toDouble())
+        // refDeg is the game's y-flipped fire angle (atan2(-dy,dx)); the game converts
+        // it with -PI/180. Negate it here so the weapon-local +x axis points along
+        // the actual firing direction instead of opposite to it when aiming upward.
+        val rad = -Math.toRadians(refDeg.toDouble())
         val c = kotlin.math.cos(rad)
         val s = kotlin.math.sin(rad)
         val dx = (design.first * c - design.second * s) * muzzleDesignScale
