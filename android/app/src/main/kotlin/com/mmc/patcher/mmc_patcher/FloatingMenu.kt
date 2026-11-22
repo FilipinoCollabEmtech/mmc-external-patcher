@@ -622,7 +622,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         unit: String,
         onChange: (Int) -> Boolean,
     ): View {
-        var current = (sliderValues[key] ?: min.toFloat()).toInt().coerceIn(min, max)
+        val current = (sliderValues[key] ?: min.toFloat()).toInt().coerceIn(min, max)
         val icon = TextView(activity).apply {
             text = glyph
             gravity = Gravity.CENTER
@@ -655,7 +655,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
             addView(valueText)
         }
         val seek = SeekBar(activity).apply {
-            max = (max - min) / step
+            this.max = (max - min) / step
             progress = (current - min) / step
             progressTintList = ColorStateList.valueOf(accent)
             thumbTintList = ColorStateList.valueOf(accent)
