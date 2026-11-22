@@ -366,8 +366,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 ok
             }
         })
-        container.addView(toggleRow("autoGrenade", "✹", "Auto Grenade",
-            "Auto-throws at crouched enemies · no HUD tap needed") { checked ->
+        container.addView(toggleRow("autoGrenade", "✹", "Grenade Aim",
+            "Ballistic aim on crouched enemies · tap HUD grenade to throw") { checked ->
             if (!ensureAttached()) {
                 toast("Launch MMC first")
                 false
@@ -388,7 +388,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 }
                 val ok = toggleAutoGrenade(true)
                 if (ok) {
-                    toast("Auto Grenade ON - throws automatically")
+                    toast("Grenade aim ON - tap HUD grenade to throw")
                     Handler(Looper.getMainLooper()).post { refreshPanel() }
                 } else {
                     toast("Auto Grenade failed - see GREN log")

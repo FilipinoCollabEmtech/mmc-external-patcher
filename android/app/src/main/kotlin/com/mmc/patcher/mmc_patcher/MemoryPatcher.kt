@@ -142,6 +142,7 @@ internal object MemoryPatcher {
     private const val TRIGGER_HOLD_MS = 100L   // >= 3 frames at 30 FPS
     private const val TRIGGER_MAX_HOLD_MS = 320L
     private const val AIM_TARGET_MATCH_RADIUS = 40.0  // cocos points
+    private const val TRIG_UNKNOWN_RANGE_CAP = 800.0  // conservative cap when weapon read fails
 
     @Volatile private var triggerRunning = false
     private var triggerThread: Thread? = null
@@ -1703,10 +1704,12 @@ internal object MemoryPatcher {
                         val range = w?.let { effectiveRangeOf(cp, it) } ?: 0.0
                         // Unknown range fails open; known range stops short by a small margin.
                         val margin = if (range > 0.0) maxOf(RANGE_SAFETY_MARGIN, range * RANGE_SAFETY_FRACTION) else 0.0
-                        // Weapon pointer unreadable -> preserve firing. Weapon present but
-                        // stats invalid (EMP/grenade) -> fail closed instead of 4000 range.
+                        // Unknown weapon (transient read during respawn/weapon swap) gets a
+                        // conservative cap, not the old 4000, so it cannot burn ammo at a
+                        // target the real weapon could never reach. Weapon present with
+                        // invalid stats (EMP/grenade) fails fully closed.
                         val gateLimit = when {
-                            w == null -> 4000.0
+                            w == null -> TRIG_UNKNOWN_RANGE_CAP
                             range <= 0.0 -> 0.0
                             else -> maxOf(10.0, range - margin)
                         }
@@ -1803,7 +1806,10 @@ internal object MemoryPatcher {
                                         // cave. A wall on that exact target still blocks fire.
                                         aimMatch != null && losState != true -> reason = "LOS"
                                         !target.hit -> reason = "off-ray"
-                                        else -> shouldFire = true
+                                        else -> {
+                                            shouldFire = true
+                                            reason = "fire"
+                                        }
                                     }
                                 }
                             }
@@ -2169,16 +2175,15 @@ internal object MemoryPatcher {
         if (autoGrenadeEnabled) return true
         val pid = findPid() ?: return false
         val base = findModuleBase(pid) ?: return false
-        // Install before the loop starts: no arm flag can be set without a validated hook.
-        if (!installGrenadeHook(pid, base)) {
-            PatchLogger.log("GREN", "auto grenade NOT enabled - $grenadeFailReason")
-            return false
-        }
+        // The in-game throwDual cave was removed: it crashed the game on its first
+        // call twice with an identical fault address, because the arc solver can
+        // produce a >90 s backward launch. Ballistic aim stays external and safe;
+        // the operator completes the throw with the real HUD grenade button.
         autoGrenadeEnabled = true
         lastGrenadeMs = 0L
         grenadeCountBefore = -1
         grenadeCountAfter = -1
-        PatchLogger.log("GREN", "auto grenade ON - automatic throw via $grenadeDiag")
+        PatchLogger.log("GREN", "grenade ballistic aim ON - tap HUD grenade to throw (no in-game call)")
 
         autoGrenadeThread = Thread {
             var p = pid
@@ -2197,17 +2202,6 @@ internal object MemoryPatcher {
                     }
                     p = cp
                     b = cb
-                    if (!grenadeHookInstalled || grenadeHookBase != cb) {
-                        // A relaunch destroys the old process; install fresh in the new one.
-                        autoGrenadeArmed = false
-                        if (!installGrenadeHook(cp, cb)) {
-                            autoGrenadeInfo = "hook lost - $grenadeFailReason"
-                            Thread.sleep(200)
-                            continue
-                        }
-                        lastAttempts = 0L
-                    }
-
                     val (gravity, gravitySrc) = grenadeGravityOf(p, b)
                     val lc = writableLocalController(p, b)
                     val origin = lc?.let { soldierPosition(p, it) }
@@ -2256,7 +2250,10 @@ internal object MemoryPatcher {
                                 autoGrenadeArmed = true
                                 grenadeCountBefore = count ?: -1
                                 if (now - lastGrenadeMs >= GRENADE_COOLDOWN_MS) {
-                                    armGrenadeThrow(p, b, arc.angleDeg)
+                                    // Pure memory write: publish the solved angle and signal
+                                    // readiness. No game code is called from a cave.
+                                    writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, arc.angleDeg)
+                                    grenadeThrowRequested = true
                                     lastGrenadeMs = now
                                 }
                             } else {
