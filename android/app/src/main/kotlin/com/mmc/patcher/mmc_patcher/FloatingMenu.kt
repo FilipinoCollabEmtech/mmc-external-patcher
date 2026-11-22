@@ -377,6 +377,26 @@ internal class FloatingMenu(private val activity: MainActivity) {
             true // keep the value even before the game launches
         })
 
+        container.addView(sectionTitle("NETWORK / JOIN CAPTURE"))
+        container.addView(toggleRow("joincap", "↥", "Capture Multiplayer Join", "Tap, join a match, tap again - copies summary") { checked ->
+            if (checked) {
+                val path = JoinCapture.start(activity)
+                toast("Capture started")
+                PatchLogger.log("JOINCAP", "start $path")
+                true
+            } else {
+                val summary = JoinCapture.stop()
+                PatchLogger.log("JOINCAP", "stopped")
+                val copied = runCatching {
+                    val cm = activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("MMC join capture", summary))
+                    true
+                }.getOrDefault(false)
+                toast(if (copied) "Join capture copied" else "Saved in files/join_captures")
+                true
+            }
+        })
+
         container.addView(sectionTitle("DIAGNOSTICS"))
         container.addView(toggleRow("debug", "i", "Live Debug Data", "Show pointers and target values") { checked ->
             if (checked) {
