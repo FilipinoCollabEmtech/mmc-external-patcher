@@ -1007,7 +1007,7 @@ internal object MemoryPatcher {
         val view = readLong(pid, lc + 0x150) ?: return
         if (view == 0L) return
         // A scene swap can leave a dangling view pointer; reject it before writing.
-        if (readFloat(pid, view + 0x29c)?.let { finite(it) } != true) return
+        if (readFloat(pid, view + 0x29c)?.let { finite(it.toDouble()) } != true) return
         val zero = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0f).array()
         for (off in longArrayOf(0x298, 0x29c, 0x2a4)) writeBytes(pid, view + off, zero)
     }
@@ -1307,7 +1307,7 @@ internal object MemoryPatcher {
         if (jp == 0L) return false
         val angle = readFloat(pid, jp + JOY_ANGLE) ?: return false
         val state = readBytes(pid, jp + JOY_FIRE_STATE, 1)?.get(0)?.toInt() ?: return false
-        return finite(angle) && kotlin.math.abs(angle) < 100000f && (state == 0 || state == 1)
+        return finite(angle.toDouble()) && kotlin.math.abs(angle) < 100000f && (state == 0 || state == 1)
     }
 
     private fun releaseFire(pid: Int, base: Long, jp: Long) {
