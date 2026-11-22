@@ -62,6 +62,12 @@ internal object MemoryPatcher {
     private const val TARGET_LIB = "libcocos2dcpp.so"
 
     private const val FIRE_ANGLE_OFFSET = 0x6888f0L
+    // Verified in cocos_new.so at file/vaddr offset 0x1084a18: 35 fa 8e bc =
+    // float32 -0.017453292f = -PI/180. addBullet/addGrenade/addRocket/addShell/addSaw
+    // all do rad = degrees * this constant, then fire along (cos(rad), sin(rad))
+    // (disasm:904723-904728, 904918-904922, 904991-905002, 509779-509796).
+    // Our atan2(-dy,dx) degree convention is therefore already correct: the game
+    // turns it into the world direction (dx,dy)/|d|. No extra PI or 180 offset.
     private const val LOCAL_CONTROLLER_GLOBAL = 0x13bec80L
     private const val REMOTE_PLAYERS_GLOBAL = 0x13bf260L
     private const val ALL_DRONES_GLOBAL = 0x13be0a0L
@@ -1142,6 +1148,7 @@ internal object MemoryPatcher {
      */
     private fun firingOrigin(
         pid: Int, w: Long?, body: Pair<Double, Double>, refDeg: Float,
+        refDist: Double,
     ): Pair<Double, Double> {
         if (!muzzleUseDesign) {
             return body.first + muzzleOffsetX to body.second + muzzleOffsetY
@@ -1153,8 +1160,21 @@ internal object MemoryPatcher {
         val rad = -Math.toRadians(refDeg.toDouble())
         val c = kotlin.math.cos(rad)
         val s = kotlin.math.sin(rad)
-        val dx = (design.first * c - design.second * s) * muzzleDesignScale
-        val dy = (design.first * s + design.second * c) * muzzleDesignScale
+        var dx = (design.first * c - design.second * s) * muzzleDesignScale
+        var dy = (design.first * s + design.second * c) * muzzleDesignScale
+        // The rotated design muzzle is ~96 world units from the body. When a target is
+        // closer than that, the predicted origin lands PAST it and the origin->target
+        // vector reverses: the angle derived from it is 180 degrees off (deg=347.6 at
+        // d=16 in the device log). Keep the offset strictly inside the target distance
+        // so the direction stays well-defined at point-blank range.
+        val mag = hypot(dx, dy)
+        // 0.9 leaves a 10% margin: full design offset at every normal range, clamped
+        // only when the target is close enough for the muzzle to reach/past it.
+        val cap = refDist * 0.9
+        if (mag > 0.0 && finite(cap) && cap > 0.0 && mag > cap) {
+            dx *= cap / mag
+            dy *= cap / mag
+        }
         return body.first + dx to body.second + dy
     }
 
@@ -1271,6 +1291,37 @@ internal object MemoryPatcher {
     }
 
     /**
+     * Direction sanity for the value actually written into the aimlock literal slot.
+     * `gameVel` is the direction the game will fire along: rad = -deg * PI/180,
+     * velocity = (cos(rad), sin(rad)). It must point the same way as the independent
+     * body->target direction; the dot product below is the test.
+     */
+    private data class AimFlipSnapshot(
+        val targetX: Double = 0.0, val targetY: Double = 0.0,
+        val expectedX: Double = 0.0, val expectedY: Double = 0.0,
+        val originDx: Double = 0.0, val originDy: Double = 0.0,
+        val computedDeg: Float = Float.NaN,
+        val gameRad: Double = Double.NaN,
+        val gameVelX: Double = Double.NaN, val gameVelY: Double = Double.NaN,
+        val dot: Double = Double.NaN,
+        val flipped: Boolean = false,
+        val fallbackDeg: Float = Float.NaN,
+        val writtenDeg: Float = Float.NaN,
+    )
+    @Volatile private var aimFlip = AimFlipSnapshot()
+
+    /** The game's degree -> world-velocity mapping, duplicated verbatim from the .so. */
+    private fun gameVelocity(deg: Float): Triple<Double, Double, Double> {
+        val rad = -Math.toRadians(deg.toDouble())
+        return Triple(rad, kotlin.math.cos(rad), kotlin.math.sin(rad))
+    }
+
+    private fun normalizeDeg(deg: Double): Float {
+        val d = deg % 360.0
+        return (if (d < 0.0) d + 360.0 else d).toFloat()
+    }
+
+    /**
      * Zero recoil/sway. Optionally publish the resolved angle into the view's base
      * firing-angle field: SoldierView::getFiringAngle (0x8fb0ac, disasm:1158685) reads
      * view+0x2a0 plus the sway/recoil fields at +0x2a4 and +0x298, which Stage's
@@ -1308,15 +1359,18 @@ internal object MemoryPatcher {
         // Rotation reference for the design-offset muzzle mode: nearest target from
         // the body. Fixed-offset mode (the default) does not depend on this.
         val ref = hostiles.minByOrNull { hypot(it.x - body.first, it.y - body.second) }
+        val refDist = ref?.let { hypot(it.x - body.first, it.y - body.second) } ?: 0.0
         val refRad = if (ref != null) atan2(-(ref.y - body.second), ref.x - body.first) else 0.0
         val refDeg = (Math.toDegrees(refRad)).toFloat().let { if (it < 0f) it + 360f else it }
         // Bullets originate at the weapon firing point, not the physics body centre.
-        val origin = firingOrigin(pid, w, body, refDeg)
+        val origin = firingOrigin(pid, w, body, refDeg, refDist)
 
         zeroSway(pid, lc)
         losOrigin = origin
         var best = 4000.0
         var found = Float.NaN
+        var chosenLeadX = Double.NaN
+        var chosenLeadY = Double.NaN
         var snap = PredictSnapshot(
             weapon = weaponNameOf(pid, w), range = range, speed = speed,
             bodyX = body.first, bodyY = body.second,
@@ -1341,6 +1395,8 @@ internal object MemoryPatcher {
             var deg = (atan2(-dy, dx) * 180.0 / Math.PI).toFloat()
             if (deg < 0f) deg += 360f
             found = deg
+            chosenLeadX = lead.x
+            chosenLeadY = lead.y
             // Keep the LOS probe on the target's real position: Wall Check semantics unchanged.
             losTarget = t.x to t.y
             snap = snap.copy(
@@ -1352,13 +1408,58 @@ internal object MemoryPatcher {
                 targetX = t.x, targetY = t.y, targetKey = targetKey(t),
             )
         }
+
+        // ---- DIRECTION SANITY CHECK ----
+        // The game maps our degrees to a world velocity with rad = -deg*PI/180 and
+        // (cos(rad), sin(rad)). Verify that vector still points from the body at the
+        // chosen intercept. If a close target put the rotated design muzzle PAST it,
+        // origin->lead reverses and the derived angle is 180 degrees off. The body is
+        // independent of that origin, so its direction is the authoritative fallback.
+        val finalDeg: Float
+        var flip = AimFlipSnapshot()
+        if (!found.isNaN() && finite(chosenLeadX) && finite(chosenLeadY)) {
+            val ex = chosenLeadX - body.first
+            val ey = chosenLeadY - body.second
+            val magE = hypot(ex, ey)
+            if (magE > 1.0) {
+                val (rad, gvx, gvy) = gameVelocity(found)
+                // gvx/gvy are unit length: this dot is the cosine of the error angle.
+                val dot = (gvx * ex + gvy * ey) / magE
+                val fallback = normalizeDeg(atan2(-ey, ex) * 180.0 / Math.PI)
+                val flipped = dot < 0.0  // mismatch greater than 90 degrees
+                finalDeg = if (flipped) fallback else found
+                flip = AimFlipSnapshot(
+                    targetX = snap.targetX, targetY = snap.targetY,
+                    expectedX = ex, expectedY = ey,
+                    originDx = chosenLeadX - origin.first,
+                    originDy = chosenLeadY - origin.second,
+                    computedDeg = found, gameRad = rad,
+                    gameVelX = gvx, gameVelY = gvy, dot = dot,
+                    flipped = flipped, fallbackDeg = fallback,
+                )
+                if (flipped) {
+                    logPredict("AIMFLIP",
+                        "origin overshoot reversed aim: tgtDir=${"%.1f,%.1f".format(ex, ey)} " +
+                            "originDir=${"%.1f,%.1f".format(chosenLeadX - origin.first, chosenLeadY - origin.second)} " +
+                            "deg=${"%.1f".format(found)} rad=${"%.4f".format(rad)} " +
+                            "gameVel=${"%.3f,%.3f".format(gvx, gvy)} dot=${"%.3f".format(dot)} " +
+                            "fallback=${"%.1f".format(fallback)}")
+                }
+            } else {
+                finalDeg = found
+            }
+        } else {
+            finalDeg = found
+        }
+        aimFlip = flip
         aimPredict = snap
         logPredict("AIM",
             "pred w=${snap.weapon} speed=${"%.0f".format(speed)} range=${"%.0f".format(range)} " +
                 "tgt=${snap.targetKind} d=${"%.0f".format(snap.rawDist)} " +
                 "v=${"%.0f".format(snap.vx)},${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
                 "tt=${"%.3f".format(snap.travel)} lead=${"%.0f".format(snap.predictedDist)} " +
-                "deg=${"%.1f".format(snap.leadAngle)} it=${snap.iterations}")
+                "deg=${"%.1f".format(snap.leadAngle)} flip=${if (flip.flipped) 1 else 0} " +
+                "it=${snap.iterations}")
         logPredict("AIMACC",
             "origin=${"%.0f,%.0f".format(origin.first, origin.second)} " +
                 "body=${"%.0f,%.0f".format(body.first, body.second)} " +
@@ -1366,7 +1467,7 @@ internal object MemoryPatcher {
                 "speedRaw=${"%.2f".format(speedRaw)} scale=$BULLET_SPEED_SCALE " +
                 "flight=${"%.3f".format(snap.travel)} leadVec=${"%.1f,%.1f".format(snap.leadX, snap.leadY)} " +
                 "valid=$validSpeed clamp=${snap.clamped} accel=$LEAD_ACCEL_GAIN")
-        return found
+        return finalDeg
     }
 
     fun toggleAimlock(enable: Boolean): Boolean {
@@ -1397,6 +1498,15 @@ internal object MemoryPatcher {
                         val override = grenadeOverrideAngle
                         val angle = if (override.isNaN()) aim else override
                         writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, angle)
+                        aimFlip = aimFlip.copy(writtenDeg = angle)
+                        // The LOS cave returns native [Joypad+0x180] instead of the
+                        // literal when its segment query fails. That can point anywhere,
+                        // including opposite the target, so surface the condition.
+                        if (losActive && losVisible(p, b) == false && override.isNaN()) {
+                            logPredict("AIMFLIP",
+                                "LOS query failed - getter serving native joypad angle " +
+                                    "instead of written $angle deg")
+                        }
                         // Publish the same angle into the view's firing-angle base so
                         // bullets (SoldierView::getFiringAngle) cannot lag the reticle
                         // by one sight-update frame. NaN is left for native control.
@@ -2506,6 +2616,19 @@ internal object MemoryPatcher {
             "calibrate: setMuzzleOffset(dx,dy) / setMuzzleUseDesign(on,scale)")
         sb.appendLine("  FILL speedScale=$BULLET_SPEED_SCALE accelGain=$LEAD_ACCEL_GAIN - " +
             "only raise after live A/B test against a stationary target")
+        // AIM FLIP: the written degrees -> game velocity mapping and its direction check.
+        val af = aimFlip
+        sb.appendLine("=== AIM FLIP ===")
+        sb.appendLine("  target=${f1(af.targetX)},${f1(af.targetY)} " +
+            "expectedDir(body->lead)=${f1(af.expectedX)},${f1(af.expectedY)} " +
+            "originDir(origin->lead)=${f1(af.originDx)},${f1(af.originDy)}")
+        sb.appendLine("  computedDeg=${"%.1f".format(af.computedDeg)} " +
+            "gameRad=${"%.4f".format(af.gameRad)} " +
+            "gameVel(cos,sin)=${"%.3f,%.3f".format(af.gameVelX, af.gameVelY)}")
+        sb.appendLine("  dot=${"%.3f".format(af.dot)} flipped=${af.flipped} " +
+            "fallbackDeg=${"%.1f".format(af.fallbackDeg)} " +
+            "writtenDeg=${"%.1f".format(af.writtenDeg)} " +
+            "(rad=-deg*PI/180, dot<0 means >90deg off)")
         val g = trigPredict
         sb.appendLine("PREDICT TRIG: w=${g.weapon} range=${f1(g.range)} speed=${f1(g.speed)} " +
             "tgt=${g.targetKind} d=${f1(g.rawDist)} v=${f1(g.vx)},${f1(g.vy)}[${g.velSrc}] " +
