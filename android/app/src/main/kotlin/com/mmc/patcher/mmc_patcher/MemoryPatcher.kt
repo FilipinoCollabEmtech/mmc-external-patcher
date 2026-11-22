@@ -24,6 +24,7 @@ internal data class Camera(
     val x: Float, val y: Float,           // accumulated world offset in cocos points
     val width: Float, val height: Float,  // winSize in points
     val scaleX: Float = 1f, val scaleY: Float = 1f,
+    val csf: Float = 1f,
 )
 
 internal val PATCH_GROUPS = listOf(
@@ -385,6 +386,7 @@ internal object MemoryPatcher {
         val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
         val width = readFloat(pid, director + 0xd0) ?: return null
         val height = readFloat(pid, director + 0xd4) ?: return null
+        val csf = readFloat(pid, director + 0xd8) ?: 1f
         val scene = readLong(pid, director + 0xa0) ?: return null
 
         var bestMag = -1f
@@ -425,7 +427,7 @@ internal object MemoryPatcher {
                 }
             }
         }
-        return Camera(bestX, bestY, width, height, if (bestMag > 0f) bestSx else 1f, if (bestMag > 0f) bestSy else 1f)
+        return Camera(bestX, bestY, width, height, if (bestMag > 0f) bestSx else 1f, if (bestMag > 0f) bestSy else 1f, csf)
     }
 
     private fun children(pid: Int, node: Long): List<Long> {
@@ -773,20 +775,23 @@ internal object MemoryPatcher {
             sb.appendLine("scene missing - cannot walk hierarchy")
         }
 
-        val kx = if ((c?.width ?: 0f) > 0f) viewW / c!!.width else 1f
-        val ky = if ((c?.height ?: 0f) > 0f) viewH / c!!.height else 1f
-        fun screen(x: Double, y: Double): String {
-            if (c == null) return "no cam"
-            val px = (x.toFloat() * c.scaleX + c.x) * kx
-            val py = (y.toFloat() * c.scaleY + c.y) * ky
-            return "${px.toInt()},${(viewH - py).toInt()}"
+        val csf = (c?.csf ?: 1f).let { if (it > 0f) it else 1f }
+        val scale = if (c != null && c.width * csf > 0f && c.height * csf > 0f)
+            minOf(viewW / (c.width * csf), viewH / (c.height * csf)) else 1f
+        sb.appendLine("projScale=$scale csf=$csf")
+        fun screen(x: Double, y: Double, ax: Double, ay: Double): String {
+            val px = viewW / 2f + ((x - ax) * scale).toFloat()
+            val py = viewH / 2f - ((y - ay) * scale).toFloat()
+            return "${px.toInt()},${py.toInt()}"
         }
         val local = localPosition(pid, base)
-        sb.appendLine("local raw=${local?.first?.toInt()},${local?.second?.toInt()} screen=${local?.let { screen(it.first, it.second) }}")
+        sb.appendLine("local raw=${local?.first?.toInt()},${local?.second?.toInt()} screen=${local?.let { screen(it.first, it.second, it.first, it.second) }}")
         var i = 0
         for (t in collectTargets(pid, base)) {
             if (i++ >= 8) break
-            sb.appendLine("target kind=${t.kind} raw=${t.x.toInt()},${t.y.toInt()} screen=${screen(t.x, t.y)}")
+            val ax = local?.first ?: t.x
+            val ay = local?.second ?: t.y
+            sb.appendLine("target kind=${t.kind} raw=${t.x.toInt()},${t.y.toInt()} screen=${screen(t.x, t.y, ax, ay)}")
         }
         return sb.toString()
     }
