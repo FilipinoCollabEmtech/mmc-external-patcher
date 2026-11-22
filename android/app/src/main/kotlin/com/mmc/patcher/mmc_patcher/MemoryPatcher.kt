@@ -20,7 +20,11 @@ internal const val KIND_PLAYER = 5
 internal const val KIND_LOCAL = 6
 
 internal data class EspTarget(val x: Double, val y: Double, val kind: Int, val hp: Float)
-internal data class Camera(val x: Float, val y: Float, val width: Float, val height: Float)
+internal data class Camera(
+    val x: Float, val y: Float,           // accumulated world offset in cocos points
+    val width: Float, val height: Float,  // winSize in points
+    val scaleX: Float = 1f, val scaleY: Float = 1f,
+)
 
 internal val PATCH_GROUPS = listOf(
     PatchGroup("God Mode", listOf(
@@ -359,26 +363,69 @@ internal object MemoryPatcher {
 
     // ---- ESP camera ----
 
+    private class NodeInfo(
+        val px: Float, val py: Float,
+        val sx: Float, val sy: Float,
+        val ax: Float, val ay: Float,
+        val cw: Float, val ch: Float,
+    )
+
+    private fun nodeInfo(pid: Int, node: Long): NodeInfo? {
+        val buf = readBytes(pid, node, 0x54) ?: return null
+        val b = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+        return NodeInfo(
+            px = b.getFloat(0x2c), py = b.getFloat(0x30),
+            sx = b.getFloat(0x20), sy = b.getFloat(0x24),
+            ax = b.getFloat(0x44), ay = b.getFloat(0x48),
+            cw = b.getFloat(0x4c), ch = b.getFloat(0x50),
+        )
+    }
+
     fun camera(pid: Int, base: Long): Camera? {
         val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
         val width = readFloat(pid, director + 0xd0) ?: return null
         val height = readFloat(pid, director + 0xd4) ?: return null
         val scene = readLong(pid, director + 0xa0) ?: return null
-        var best = -1f
-        var camX = 0f
-        var camY = 0f
+
+        var bestMag = -1f
+        var bestX = 0f
+        var bestY = 0f
+        var bestSx = 1f
+        var bestSy = 1f
+
+        // Depth 2 is the normal case (same layer Main.cpp uses). Depth 3 is a
+        // fallback for scenes with one extra wrapper node. Lower bound is
+        // relaxed from 100 to 1 so small camera shifts still resolve.
         for (c1 in children(pid, scene)) {
-            val p1 = readPoint(pid, c1) ?: continue
+            val n1 = nodeInfo(pid, c1) ?: continue
             for (c2 in children(pid, c1)) {
-                val p2 = readPoint(pid, c2) ?: continue
-                val mag = kotlin.math.abs(p2.first) + kotlin.math.abs(p2.second)
-                if (mag < 100f || mag > 8000f || mag <= best) continue
-                best = mag
-                camX = p1.first + p2.first
-                camY = p1.second + p2.second
+                val n2 = nodeInfo(pid, c2) ?: continue
+                val sx = n1.sx * n2.sx
+                val sy = n1.sy * n2.sy
+                fun consider(mag: Float, offX: Float, offY: Float, csx: Float, csy: Float) {
+                    if (mag in 1f..8000f && mag > bestMag) {
+                        bestMag = mag; bestX = offX; bestY = offY; bestSx = csx; bestSy = csy
+                    }
+                }
+                consider(
+                    kotlin.math.abs(n2.px) + kotlin.math.abs(n2.py),
+                    n1.px + n2.px * n1.sx - n2.ax * n2.cw * sx - n1.ax * n1.cw * n1.sx,
+                    n1.py + n2.py * n1.sy - n2.ay * n2.ch * sy - n1.ay * n1.ch * n1.sy,
+                    sx, sy,
+                )
+                if (bestMag >= 100f) continue
+                for (c3 in children(pid, c2)) {
+                    val n3 = nodeInfo(pid, c3) ?: continue
+                    consider(
+                        kotlin.math.abs(n3.px) + kotlin.math.abs(n3.py),
+                        n1.px + n2.px * n1.sx + n3.px * sx - n3.ax * n3.cw * sx * n3.sx,
+                        n1.py + n2.py * n1.sy + n3.py * sy - n3.ay * n3.ch * sy * n3.sy,
+                        sx * n3.sx, sy * n3.sy,
+                    )
+                }
             }
         }
-        return Camera(camX, camY, width, height)
+        return Camera(bestX, bestY, width, height, if (bestMag > 0f) bestSx else 1f, if (bestMag > 0f) bestSy else 1f)
     }
 
     private fun children(pid: Int, node: Long): List<Long> {
