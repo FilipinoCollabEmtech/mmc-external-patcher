@@ -549,6 +549,7 @@ internal object MemoryPatcher {
         var rvx: Double = 0.0, var rvy: Double = 0.0,
         var src: String = "-",
         var stableTicks: Int = 0,
+        var stationaryTicks: Int = 0,
     )
     private val velHistory = ConcurrentHashMap<Long, VelMem>()
 
@@ -610,17 +611,32 @@ internal object MemoryPatcher {
 
         val directSpeed = direct?.let { hypot(it.first, it.second) } ?: -1.0
         val diffSpeed = diff?.let { hypot(it.first, it.second) } ?: -1.0
-        // A zero replicated field with a visibly moving target means the field is stale.
-        val useDirect = direct != null && (directSpeed > 1.0 || diffSpeed < 0.0 || diffSpeed < 2.0)
-        val src = if (useDirect) "mem" else if (diff != null) "diff" else "hold"
+
+        // Observed world-space motion is ground truth. If the target's position has
+        // been effectively unchanged for several samples, it is stationary even when
+        // the game's velocity field reports motion (a stale replicated field, or a
+        // field that means something other than world velocity). Trusting that stale
+        // field is what produces a lead on a stationary enemy while the shooter moves.
+        val diffStationary = diffSpeed in 0.0..VEL_STATIONARY_SPEED
+        val stationaryTicks = if (diffStationary) (prev?.stationaryTicks ?: 0) + 1 else 0
+        val trustStationary = stationaryTicks >= VEL_STATIONARY_TICKS
+
+        // Reject a memory field whose heading disagrees sharply with observed motion.
+        val headingAgrees = if (direct != null && diff != null && directSpeed > 1.0 && diffSpeed > 1.0) {
+            (direct.first * diff.first + direct.second * diff.second) / (directSpeed * diffSpeed) > 0.5
+        } else true
+
+        val useDirect = direct != null && !trustStationary && headingAgrees
+        val src = if (trustStationary) "stationary" else if (useDirect) "mem" else if (diff != null) "diff" else "hold"
         val raw = when {
+            trustStationary -> 0.0 to 0.0
             useDirect -> direct
             diff != null -> diff
             else -> prev?.let { it.evx to it.evy } ?: (0.0 to 0.0)
         }
 
         val sameSource = prev != null && prev.src == src
-        val alpha = if (useDirect) VEL_EMA else DIFF_EMA
+        val alpha = if (trustStationary) STATIONARY_EMA else if (useDirect) VEL_EMA else DIFF_EMA
         val evx = if (sameSource) prev.evx + alpha * (raw.first - prev.evx) else raw.first
         val evy = if (sameSource) prev.evy + alpha * (raw.second - prev.evy) else raw.second
         val stable = if (sameSource) (prev.stableTicks + 1).coerceAtMost(VEL_STABLE_TICKS) else 0
@@ -638,7 +654,7 @@ internal object MemoryPatcher {
             ax = if (sameSource) prev.ax else 0.0
             ay = if (sameSource) prev.ay else 0.0
         }
-        velHistory[key] = VelMem(t.x, t.y, now, evx, evy, ax, ay, raw.first, raw.second, src, stable)
+        velHistory[key] = VelMem(t.x, t.y, now, evx, evy, ax, ay, raw.first, raw.second, src, stable, stationaryTicks)
         if (velHistory.size > 128) {
             val it = velHistory.entries.iterator()
             while (it.hasNext()) if (now - it.next().value.t > 2000L) it.remove()
@@ -852,6 +868,10 @@ internal object MemoryPatcher {
     private const val ACCEL_EMA = 0.15            // heavy damping on the residual acceleration
     private const val MAX_ACCEL = 2000.0          // cocos points/s^2; hard cap (was 20000)
     private const val VEL_STABLE_TICKS = 8        // require a stable source before trusting accel
+    private const val VEL_STATIONARY_SPEED = 15.0 // points/s: observed motion below this is "not moving"
+    private const val VEL_STATIONARY_TICKS = 3    // consecutive samples before we zero a stale field
+    private const val STATIONARY_EMA = 0.60       // decay fast once a target is confirmed stationary
+    private const val TARGET_STATIONARY_SPEED = 20.0 // below this, intercept() aims straight (no lead)
     private const val VEL_MIN_DT_MS = 8L
     private const val VEL_MAX_DT_MS = 250L
     private const val MAX_LEAD_SECONDS = 1.5      // clamp so stale/fast fields cannot explode
@@ -1167,6 +1187,11 @@ internal object MemoryPatcher {
         vx: Double, vy: Double, ax: Double, ay: Double, speed: Double,
     ): Lead {
         if (speed <= 0.0 || !finite(speed)) return Lead(tx, ty, 0.0, 0)
+        // A stationary enemy needs no lead at all. Without this, a stale velocity
+        // field aims at a point beside the target even though it is not moving.
+        if (!finite(vx) || !finite(vy) || hypot(vx, vy) < TARGET_STATIONARY_SPEED) {
+            return Lead(tx, ty, hypot(tx - ox, ty - oy) / speed, 0)
+        }
         var t = hypot(tx - ox, ty - oy) / speed
         var px = tx
         var py = ty
@@ -1798,6 +1823,7 @@ internal object MemoryPatcher {
                                         ax = t.ax, ay = t.ay,
                                         travel = lead.seconds, predictedDist = gateDist,
                                         iterations = lead.iterations, gatePass = inRange,
+                                        leadX = lead.x - t.x, leadY = lead.y - t.y,
                                         targetX = t.x, targetY = t.y, targetKey = key,
                                     )
                                     when {
@@ -1845,9 +1871,12 @@ internal object MemoryPatcher {
                                     lastFireMs = now
                                     trigFireWrites++
                                     trigSuccessCount++
+                                    // Per-enemy motion captured at this exact fire instant.
                                     logPredict("TRIGF",
                                         "pull#$trigSuccessCount key=$key raw=${"%.0f".format(snap.rawDist)} " +
-                                            "pred=${"%.0f".format(snap.predictedDist)} los=$losSource")
+                                            "pred=${"%.0f".format(snap.predictedDist)} los=$losSource " +
+                                            "v=${"%.0f,%.0f".format(snap.vx, snap.vy)}[${snap.velSrc}] " +
+                                            "leadVec=${"%.1f,%.1f".format(snap.leadX, snap.leadY)}")
                                 }
                             }
                             else -> {
