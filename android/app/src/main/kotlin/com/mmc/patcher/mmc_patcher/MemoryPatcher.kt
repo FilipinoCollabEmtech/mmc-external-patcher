@@ -19,12 +19,17 @@ internal const val KIND_AI = 4
 internal const val KIND_PLAYER = 5
 internal const val KIND_LOCAL = 6
 
-internal data class EspTarget(val x: Double, val y: Double, val kind: Int, val hp: Float)
+internal data class EspTarget(
+    val x: Double, val y: Double, val kind: Int, val hp: Float,
+    val friendly: Boolean = false, val teamId: Int = -1,
+)
 internal data class Camera(
-    val x: Float, val y: Float,           // accumulated world offset in cocos points
+    val x: Float, val y: Float,           // B: world offset in cocos points
     val width: Float, val height: Float,  // winSize in points
-    val scaleX: Float = 1f, val scaleY: Float = 1f,
+    val scaleX: Float = 1f, val scaleY: Float = 1f, // A: accumulated world scale
     val csf: Float = 1f,
+    val offsetX: Float = 0f, val offsetY: Float = 0f, // letterbox in screen px
+    val viewScale: Float = 1f,            // px per cocos point
 )
 
 internal val PATCH_GROUPS = listOf(
@@ -53,6 +58,15 @@ internal object MemoryPatcher {
     private const val REMOTE_PLAYERS_GLOBAL = 0x13bf260L
     private const val ALL_DRONES_GLOBAL = 0x13be0a0L
     private const val DIRECTOR_GLOBAL = 0x13ec228L
+    private const val TEAM_ID_OFFSET = 0x144L
+    private const val LOCAL_TEAM_GLOBAL = 0x13bede8L
+
+    @Volatile var teamCheck = true
+        private set
+    @Volatile var showFriendliesDimmed = false
+    private const val TEAM_FAIL_OPEN = true
+
+    fun setTeamCheck(enabled: Boolean) { teamCheck = enabled }
 
     // Internal ESP: one hook in Stage::draw, engine in the .plt/.text alignment gap.
     private const val STAGE_DRAW_OFFSET = 0x9087d8L
@@ -64,6 +78,23 @@ internal object MemoryPatcher {
     private const val LOS_CODE_OFFSET = 0x500c00L
     private const val LOS_DATA_OFFSET = 0x500e00L
     private const val LOS_BRANCH_HEX = "C4E0F917"  // b 0x500c00 from 0x6888f0
+
+    // Triggerbot: publish Joypad* from the proven LOS cave, then pull its fire byte.
+    private const val JOY_FIRE_STATE = 0x18aL
+    private const val JOY_ANGLE = 0x180L
+    private const val LOS_JOYPTR_SLOT = 0x58L
+    private const val JOYPTR_BRANCH_HEX = "35000014"
+    private const val JOYPTR_STUB_HEX = "E00300F909000090202D07F9C9FFFF17"
+    private const val TRIGGER_COOLDOWN_MS = 120L
+    private const val TRIGGER_HOLD_MS = 40L
+
+    @Volatile private var triggerRunning = false
+    private var triggerThread: Thread? = null
+    @Volatile private var joyPtrPublished = false
+    private val joyPtrSaved = HashMap<Long, ByteArray>()
+    private var savedFireState: Byte? = null
+    private var lastFireMs = 0L
+    private var firePulled = false
     private const val LOS_ENGINE_HEX =
         "ffc300d1e00300f9fe1700f9f3d300a9f55b01a9f7e301a9530f0010782a40f9e00313aa00cc7492010084d2e20080d200033fd6740240b9d4030034601240bd0020201e66030054740640f915bf81d29527a0f2956a75f8d50200b4b50240f9950200b4752200f916a48ad2b609a0f29602168be00315aa601240fd611640fd621a40fd631e40fd01208052e2031f2a63020291c0023fd6602600f9a00000b534008052740600b9601240bd0500001414008052740600b9f70340f9e08241bdf7e341a9f55b41a9f3d340a9fe1740f9ffc30091c0035fd6"
 
@@ -331,6 +362,24 @@ internal object MemoryPatcher {
     fun localController(pid: Int, base: Long): Long? =
         readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
 
+    private fun teamIdOf(pid: Int, obj: Long): Int =
+        if (obj == 0L) -1 else (readInt(pid, obj + TEAM_ID_OFFSET) ?: -1)
+
+    fun localTeamId(pid: Int, base: Long): Int {
+        val t = teamIdOf(pid, localController(pid, base) ?: 0L)
+        if (t >= 0 && t != 1 && t != 0) return t
+        val holder = readLong(pid, base + LOCAL_TEAM_GLOBAL) ?: return t
+        val g = readInt(pid, holder) ?: return t
+        return if (g >= 0) g else t
+    }
+
+    private fun isHostile(team: Int, local: Int, kind: Int): Boolean {
+        if (kind == KIND_DRONE || kind == KIND_HAWK || kind == KIND_WORM) return true
+        if (team < 0 || local < 0) return TEAM_FAIL_OPEN
+        if (team == 1 || local == 1 || team == 0 || local == 0) return true
+        return team != local
+    }
+
     fun localPosition(pid: Int, base: Long): Pair<Double, Double>? {
         val lc = localController(pid, base) ?: return null
         return soldierPosition(pid, lc)
@@ -339,6 +388,7 @@ internal object MemoryPatcher {
     fun collectTargets(pid: Int, base: Long): List<EspTarget> {
         val out = mutableListOf<EspTarget>()
         val seen = HashSet<Long>()
+        val localTeam = if (teamCheck) localTeamId(pid, base) else -1
 
         // Campaign robots: all-drones dictionary at *(*(base+0x13be0a0))
         for (obj in dictionaryObjects(pid, base, ALL_DRONES_GLOBAL)) {
@@ -355,9 +405,16 @@ internal object MemoryPatcher {
         // Multiplayer / LAN players: *(*(base+0x13bf260))
         for (ctrl in dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)) {
             if (!seen.add(ctrl)) continue
-            val body = readLong(pid, ctrl + 0x1a8) ?: continue
+            // One pread covers teamId(+0x144) and body pointer(+0x1a8).
+            val blk = readBytes(pid, ctrl + TEAM_ID_OFFSET, 0x6c) ?: continue
+            val bb = ByteBuffer.wrap(blk).order(ByteOrder.LITTLE_ENDIAN)
+            val team = bb.getInt(0)
+            val body = bb.getLong(0x64)
             val pos = bodyPosition(pid, body) ?: continue
-            out.add(EspTarget(pos.first, pos.second, KIND_PLAYER, 0f))
+            val hostile = !teamCheck || isHostile(team, localTeam, KIND_PLAYER)
+            val friendly = teamCheck && !hostile
+            if (friendly && !showFriendliesDimmed) continue
+            out.add(EspTarget(pos.first, pos.second, KIND_PLAYER, 0f, friendly, team))
         }
         return out
     }
@@ -382,52 +439,55 @@ internal object MemoryPatcher {
         )
     }
 
-    fun camera(pid: Int, base: Long): Camera? {
+    /** Fraction of the view where the game frames the local player (from device screenshot). */
+    private const val PLAYER_ANCHOR_X = 0.447f
+    private const val PLAYER_ANCHOR_Y = 0.653f
+
+    fun camera(pid: Int, base: Long, viewW: Int, viewH: Int): Camera? {
         val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return null
         val width = readFloat(pid, director + 0xd0) ?: return null
         val height = readFloat(pid, director + 0xd4) ?: return null
-        val csf = readFloat(pid, director + 0xd8) ?: 1f
         val scene = readLong(pid, director + 0xa0) ?: return null
+        val local = localPosition(pid, base) ?: return null
 
-        var bestMag = -1f
-        var bestX = 0f
-        var bestY = 0f
-        var bestSx = 1f
-        var bestSy = 1f
+        // px per cocos point: min(view/win) already includes the content scale factor.
+        val s = if (width > 0f && height > 0f) minOf(viewW / width, viewH / height) else 1f
+        val ox = (viewW - width * s) / 2f
+        val oy = (viewH - height * s) / 2f
+        val anchorX = viewW * PLAYER_ANCHOR_X
+        val anchorY = viewH * PLAYER_ANCHOR_Y
 
-        // Depth 2 is the normal case (same layer Main.cpp uses). Depth 3 is a
-        // fallback for scenes with one extra wrapper node. Lower bound is
-        // relaxed from 100 to 1 so small camera shifts still resolve.
-        for (c1 in children(pid, scene)) {
-            val n1 = nodeInfo(pid, c1) ?: continue
-            for (c2 in children(pid, c1)) {
-                val n2 = nodeInfo(pid, c2) ?: continue
-                val sx = n1.sx * n2.sx
-                val sy = n1.sy * n2.sy
-                fun consider(mag: Float, offX: Float, offY: Float, csx: Float, csy: Float) {
-                    if (mag in 1f..8000f && mag > bestMag) {
-                        bestMag = mag; bestX = offX; bestY = offY; bestSx = csx; bestSy = csy
-                    }
-                }
-                consider(
-                    kotlin.math.abs(n2.px) + kotlin.math.abs(n2.py),
-                    n1.px + n2.px * n1.sx - n2.ax * n2.cw * sx - n1.ax * n1.cw * n1.sx,
-                    n1.py + n2.py * n1.sy - n2.ay * n2.ch * sy - n1.ay * n1.ch * n1.sy,
-                    sx, sy,
-                )
-                if (bestMag >= 100f) continue
-                for (c3 in children(pid, c2)) {
-                    val n3 = nodeInfo(pid, c3) ?: continue
-                    consider(
-                        kotlin.math.abs(n3.px) + kotlin.math.abs(n3.py),
-                        n1.px + n2.px * n1.sx + n3.px * sx - n3.ax * n3.cw * sx * n3.sx,
-                        n1.py + n2.py * n1.sy + n3.py * sy - n3.ay * n3.ch * sy * n3.sy,
-                        sx * n3.sx, sy * n3.sy,
-                    )
-                }
-            }
+        data class Cand(val wx: Float, val wy: Float, val sx: Float, val sy: Float, val depth: Int)
+        val cands = ArrayList<Cand>()
+        fun walk(node: Long, depth: Int, ax: Float, ay: Float, asx: Float, asy: Float) {
+            if (depth > 3 || cands.size >= 256) return
+            val n = nodeInfo(pid, node) ?: return
+            val wx = ax + asx * (n.px - n.ax * n.cw * n.sx)
+            val wy = ay + asy * (n.py - n.ay * n.ch * n.sy)
+            val sx = asx * n.sx
+            val sy = asy * n.sy
+            cands.add(Cand(wx, wy, sx, sy, depth))
+            for (ch in children(pid, node)) walk(ch, depth + 1, wx, wy, sx, sy)
         }
-        return Camera(bestX, bestY, width, height, if (bestMag > 0f) bestSx else 1f, if (bestMag > 0f) bestSy else 1f, csf)
+        walk(scene, 0, 0f, 0f, 1f, 1f)
+
+        // The design-fit layer sits at winSize/2 with scaleX = winW/480 (from RE dump).
+        val design = cands.filter {
+            it.sx > 1.05f && it.sx < 3f && kotlin.math.abs(it.sy - 1f) < 0.25f &&
+                kotlin.math.abs(it.wx - width / 2f) < 4f &&
+                kotlin.math.abs(it.wy - height / 2f) < 4f
+        }.maxByOrNull { it.depth }
+        val ax = design?.sx ?: 1f
+        val ay = design?.sy ?: 1f
+
+        val bx = (anchorX - ox) / s - ax * local.first.toFloat()
+        val by = (viewH - anchorY - oy) / s - ay * local.second.toFloat()
+        return Camera(bx, by, width, height, ax, ay, 1f, ox, oy, s)
+    }
+
+    private fun defaultViewSize(): Pair<Int, Int> {
+        val m = android.content.res.Resources.getSystem().displayMetrics
+        return m.widthPixels to m.heightPixels
     }
 
     private fun children(pid: Int, node: Long): List<Long> {
@@ -490,7 +550,8 @@ internal object MemoryPatcher {
         dumpDict("remote", REMOTE_PLAYERS_GLOBAL, false)
         dumpDict("drones", ALL_DRONES_GLOBAL, true)
 
-        val cam = camera(pid, base)
+        val (dvw, dvh) = defaultViewSize()
+        val cam = camera(pid, base, dvw, dvh)
         val targets = collectTargets(pid, base)
         sb.appendLine("cam=${cam?.x?.toInt()},${cam?.y?.toInt()} targets=${targets.size}")
         return sb.toString()
@@ -515,6 +576,7 @@ internal object MemoryPatcher {
         var best = 4000.0
         var found = Float.NaN
         for (t in collectTargets(pid, base)) {
+            if (t.friendly) continue
             val dx = t.x - origin.first
             val dy = t.y - origin.second
             val dist = hypot(dx, dy)
@@ -717,8 +779,12 @@ internal object MemoryPatcher {
         writeBytes(pid, d, b.array())
     }
 
+    val triggerActive: Boolean get() = triggerRunning
+
     fun uninstallLos(pid: Int, base: Long) {
         if (!losActive) return
+        if (triggerRunning) toggleTriggerbot(false)
+        unpublishJoypadPointer(pid, base)
         losActive = false
         val address = base + FIRE_ANGLE_OFFSET
         losSaved.remove(address)?.let { writeBytes(pid, address, it) }
@@ -729,6 +795,177 @@ internal object MemoryPatcher {
         if (!losActive) return null
         val v = readInt(pid, base + LOS_DATA_OFFSET + 4) ?: return null
         return v == 1
+    }
+
+    // ---- triggerbot ------------------------------------------------------
+
+    private fun publishJoypadPointer(pid: Int, base: Long): Boolean {
+        if (joyPtrPublished) return true
+        if (!losActive) return false
+        val code = base + LOS_CODE_OFFSET
+        val orig = readBytes(pid, code + 4, 4) ?: return false
+        if (!orig.contentEquals(hexToBytes("E00300F9"))) {
+            PatchLogger.log("TRIG", "unexpected LOS cave prologue")
+            return false
+        }
+        if (!writeBytes(pid, code + 4, hexToBytes(JOYPTR_BRANCH_HEX))) return false
+        if (!writeBytes(pid, code + 0xd8, hexToBytes(JOYPTR_STUB_HEX))) return false
+        joyPtrSaved[code + 4] = orig
+        joyPtrPublished = true
+        return true
+    }
+
+    private fun unpublishJoypadPointer(pid: Int, base: Long) {
+        if (!joyPtrPublished) return
+        val code = base + LOS_CODE_OFFSET
+        joyPtrSaved.remove(code + 4)?.let { writeBytes(pid, code + 4, it) }
+        writeBytes(pid, code + 0xd8, ByteArray(16))
+        joyPtrPublished = false
+    }
+
+    private fun joypadPointer(pid: Int, base: Long): Long? =
+        if (!joyPtrPublished) null
+        else readLong(pid, base + LOS_DATA_OFFSET + LOS_JOYPTR_SLOT)?.takeIf { it != 0L }
+
+    private fun releaseFire(pid: Int, base: Long, jp: Long) {
+        val saved = savedFireState ?: return
+        if (jp != 0L) writeBytes(pid, jp + JOY_FIRE_STATE, byteArrayOf(saved))
+        firePulled = false
+    }
+
+    private fun rayHitsBox(
+        ox: Double, oy: Double, dx: Double, dy: Double,
+        tx: Double, ty: Double, hw: Double, hh: Double,
+    ): Boolean {
+        var tmin = 0.0
+        var tmax = 50000.0
+        if (kotlin.math.abs(dx) < 1e-6) {
+            if (ox < tx - hw || ox > tx + hw) return false
+        } else {
+            var a = (tx - hw - ox) / dx
+            var b = (tx + hw - ox) / dx
+            if (a > b) { val t = a; a = b; b = t }
+            tmin = maxOf(tmin, a); tmax = minOf(tmax, b)
+            if (tmin > tmax) return false
+        }
+        if (kotlin.math.abs(dy) < 1e-6) {
+            if (oy < ty - hh || oy > ty + hh) return false
+        } else {
+            var a = (ty - hh - oy) / dy
+            var b = (ty + hh - oy) / dy
+            if (a > b) { val t = a; a = b; b = t }
+            tmin = maxOf(tmin, a); tmax = minOf(tmax, b)
+            if (tmin > tmax) return false
+        }
+        return true
+    }
+
+    private fun halfW(k: Int) = when (k) { KIND_HAWK -> 40.0; KIND_WORM -> 10.0; KIND_PLAYER -> 25.0; else -> 25.0 }
+    private fun halfH(k: Int) = when (k) { KIND_HAWK -> 40.0; KIND_WORM -> 5.0; KIND_PLAYER -> 30.0; else -> 25.0 }
+
+    fun toggleTriggerbot(enable: Boolean): Boolean {
+        if (enable) {
+            val pid = findPid() ?: return false
+            val base = findModuleBase(pid) ?: return false
+            if (!losActive) { PatchLogger.log("TRIG", "enable Wall Check first"); return false }
+            if (!publishJoypadPointer(pid, base)) return false
+
+            var jp = 0L
+            for (i in 0 until 20) {
+                jp = joypadPointer(pid, base) ?: 0L
+                if (jp != 0L) break
+                Thread.sleep(50)
+            }
+            val state = if (jp != 0L) readBytes(pid, jp + JOY_FIRE_STATE, 1) else null
+            if (state == null) { unpublishJoypadPointer(pid, base); return false }
+            savedFireState = state[0]
+            lastFireMs = 0L
+            firePulled = false
+            triggerRunning = true
+
+            triggerThread = Thread {
+                var p = pid
+                var b = base
+                var joy = jp
+                while (triggerRunning) {
+                    try {
+                        val cp = findPid()
+                        val cb = cp?.let { findModuleBase(it) }
+                        if (cp == null || cb == null) {
+                            releaseFire(p, b, joy)
+                            Thread.sleep(100)
+                            continue
+                        }
+                        if (cp != p || cb != b) {
+                            releaseFire(p, b, joy)
+                            p = cp; b = cb
+                            joy = joypadPointer(cp, cb) ?: 0L
+                            savedFireState = if (joy != 0L) readBytes(cp, joy + JOY_FIRE_STATE, 1)?.get(0) else null
+                        }
+                        if (joy == 0L) joy = joypadPointer(cp, cb) ?: 0L
+                        val now = System.currentTimeMillis()
+                        var shouldFire = false
+
+                        val locked = readFloat(cp, cb + FIRE_ANGLE_OFFSET + 20)
+                        val native = if (joy != 0L) readFloat(cp, joy + JOY_ANGLE) else null
+                        val angle = if (locked != null && !locked.isNaN()) locked else native
+                        val origin = localPosition(cp, cb)
+
+                        if (losVisible(cp, cb) == true && origin != null &&
+                            localController(cp, cb) != null && angle != null && joy != 0L
+                        ) {
+                            val rad = if (kotlin.math.abs(angle) > 6.283185f)
+                                Math.toRadians(angle.toDouble()) else angle.toDouble()
+                            val dx = kotlin.math.cos(rad)
+                            val dy = -kotlin.math.sin(rad)
+                            val target = collectTargets(cp, cb)
+                                .filter {
+                                    it.kind == KIND_DRONE || it.kind == KIND_HAWK ||
+                                        it.kind == KIND_WORM || it.kind == KIND_PLAYER
+                                }
+                                .map { it to hypot(it.x - origin.first, it.y - origin.second) }
+                                .filter { it.second in 10.0..4000.0 }
+                                .minByOrNull { it.second }
+                            if (target != null && rayHitsBox(
+                                    origin.first, origin.second, dx, dy,
+                                    target.first.x, target.first.y,
+                                    halfW(target.first.kind), halfH(target.first.kind),
+                                )
+                            ) shouldFire = true
+                        }
+
+                        val saved = savedFireState ?: 0
+                        if (shouldFire && now - lastFireMs >= TRIGGER_COOLDOWN_MS) {
+                            if (writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(1))) {
+                                lastFireMs = now
+                                firePulled = true
+                            }
+                        } else if (firePulled && now - lastFireMs >= TRIGGER_HOLD_MS) {
+                            writeBytes(cp, joy + JOY_FIRE_STATE, byteArrayOf(saved))
+                            firePulled = false
+                        }
+                    } catch (t: Throwable) {
+                        PatchLogger.log("TRIG", "loop: ${t.message}")
+                    }
+                    Thread.sleep(16)
+                }
+                releaseFire(p, b, joy)
+            }.apply { isDaemon = true; start() }
+            return true
+        } else {
+            triggerRunning = false
+            triggerThread?.interrupt()
+            try { triggerThread?.join(200) } catch (_: InterruptedException) {}
+            triggerThread = null
+            val pid = findPid()
+            val base = pid?.let { findModuleBase(it) }
+            if (pid != null && base != null) {
+                releaseFire(pid, base, joypadPointer(pid, base) ?: 0L)
+                unpublishJoypadPointer(pid, base)
+            }
+            savedFireState = null
+            return true
+        }
     }
 
     /** Everything needed to diagnose external-ESP alignment, logged every ~2 s. */
@@ -748,7 +985,7 @@ internal object MemoryPatcher {
         val w = width ?: 0f
         val h = height ?: 0f
         sb.appendLine("view=${viewW}x${viewH} kx=${if (w > 0f) viewW / w else 1f} ky=${if (h > 0f) viewH / h else 1f}")
-        val c = camera(pid, base)
+        val c = camera(pid, base, viewW, viewH)
         sb.appendLine("chosen cam off=${c?.x?.toInt()},${c?.y?.toInt()} scale=${c?.scaleX},${c?.scaleY}")
 
         if (scene != null && scene != 0L) {
@@ -779,19 +1016,21 @@ internal object MemoryPatcher {
         val scale = if (c != null && c.width * projCsf > 0f && c.height * projCsf > 0f)
             minOf(viewW / (c.width * projCsf), viewH / (c.height * projCsf)) else 1f
         sb.appendLine("projScale=$scale csf=$projCsf")
-        fun screen(x: Double, y: Double, ax: Double, ay: Double): String {
-            val px = viewW / 2f + ((x - ax) * scale).toFloat()
-            val py = viewH / 2f - ((y - ay) * scale).toFloat()
+        sb.appendLine("A=${c?.scaleX},${c?.scaleY} B=${c?.x?.toInt()},${c?.y?.toInt()} " +
+            "letterbox=${c?.offsetX?.toInt()},${c?.offsetY?.toInt()} pxPerPoint=${c?.viewScale} " +
+            "anchor=${(viewW * PLAYER_ANCHOR_X).toInt()},${(viewH * PLAYER_ANCHOR_Y).toInt()}")
+        fun screen(x: Double, y: Double): String {
+            if (c == null) return "no cam"
+            val px = c.offsetX + (c.x + x.toFloat() * c.scaleX) * c.viewScale
+            val py = viewH - (c.offsetY + (c.y + y.toFloat() * c.scaleY) * c.viewScale)
             return "${px.toInt()},${py.toInt()}"
         }
         val local = localPosition(pid, base)
-        sb.appendLine("local raw=${local?.first?.toInt()},${local?.second?.toInt()} screen=${local?.let { screen(it.first, it.second, it.first, it.second) }}")
+        sb.appendLine("local raw=${local?.first?.toInt()},${local?.second?.toInt()} screen=${local?.let { screen(it.first, it.second) }}")
         var i = 0
         for (t in collectTargets(pid, base)) {
             if (i++ >= 8) break
-            val ax = local?.first ?: t.x
-            val ay = local?.second ?: t.y
-            sb.appendLine("target kind=${t.kind} raw=${t.x.toInt()},${t.y.toInt()} screen=${screen(t.x, t.y, ax, ay)}")
+            sb.appendLine("target kind=${t.kind} raw=${t.x.toInt()},${t.y.toInt()} screen=${screen(t.x, t.y)}")
         }
         return sb.toString()
     }
@@ -865,9 +1104,12 @@ internal object MemoryPatcher {
         }
         val players = dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)
         sb.appendLine("players objects=${players.size}")
+        sb.appendLine("teamCheck=$teamCheck localTeam=${localTeamId(pid, base)}")
         players.take(5).forEach { ctrl ->
             val pos = soldierPosition(pid, ctrl)
-            sb.appendLine("  ${hx(ctrl)} body=${hx(readLong(pid, ctrl + 0x1a8))} xy=${pos?.first?.toInt()},${pos?.second?.toInt()}")
+            val team = teamIdOf(pid, ctrl)
+            sb.appendLine("  ${hx(ctrl)} team=$team hostile=${isHostile(team, localTeamId(pid, base), KIND_PLAYER)} " +
+                "body=${hx(readLong(pid, ctrl + 0x1a8))} xy=${pos?.first?.toInt()},${pos?.second?.toInt()}")
         }
         val ld = base + LOS_DATA_OFFSET
         sb.appendLine("LOS: active=$losActive visible=${readInt(pid, ld + 4)} " +

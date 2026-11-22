@@ -23,6 +23,7 @@ import android.widget.TextView
 import android.widget.Toast
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.applyGroup
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleAimlock
+import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleTriggerbot
 
 /**
  * Draggable badge plus a scrollable control panel, drawn as a standalone
@@ -40,7 +41,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var esp: EspOverlay? = null
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
-    private val states = LinkedHashMap<String, Boolean>()
+    private val states = LinkedHashMap<String, Boolean>().apply { put("teamCheck", MemoryPatcher.teamCheck) }
 
     private val accent = Color.rgb(255, 92, 92)
     private val bg = Color.argb(248, 17, 18, 25)
@@ -292,6 +293,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
         container.addView(groupRow("ammo", "∞", "Infinite Ammo", "Clip and reserve never run dry", PATCH_GROUPS[1]))
         container.addView(groupRow("security", "SH", "Security Bypass", "Hide H4X alerts · ballistics", PATCH_GROUPS[2]))
 
+        container.addView(toggleRow("teamCheck", "◈", "Team Check", "Hide teammates from ESP and aimlock") { checked ->
+            MemoryPatcher.setTeamCheck(checked)
+            true
+        })
         container.addView(sectionTitle("AIM  /  WALL CHECK  /  ESP"))
         container.addView(toggleRow("aim", "◎", "Aimlock", "Snap to the nearest enemy") { checked ->
             toggleAimlock(checked)
@@ -317,6 +322,36 @@ internal class FloatingMenu(private val activity: MainActivity) {
                     Handler(Looper.getMainLooper()).post { refreshPanel() }
                 }
                 installed
+            }
+        })
+        container.addView(toggleRow("trigger", "✦", "Triggerbot", "Fire when crosshair and LOS confirm a target") { checked ->
+            if (!ensureAttached()) {
+                toast("Launch MMC first")
+                false
+            } else if (!checked) {
+                states["trigger"] = false
+                toggleTriggerbot(false)
+            } else {
+                if (states["aim"] != true) {
+                    if (!toggleAimlock(true)) { toast("Could not enable Aimlock"); return@toggleRow false }
+                    states["aim"] = true
+                }
+                if (states["los"] != true) {
+                    if (!MemoryPatcher.installLos(pid!!, base!!)) {
+                        toast("Could not enable Wall Check")
+                        return@toggleRow false
+                    }
+                    states["los"] = true
+                }
+                val ok = toggleTriggerbot(true)
+                if (ok) {
+                    states["trigger"] = true
+                    toast("Triggerbot ON")
+                    Handler(Looper.getMainLooper()).post { refreshPanel() }
+                } else {
+                    toast("Triggerbot failed - check log")
+                }
+                ok
             }
         })
         container.addView(toggleRow("espBoxes", "▣", "ESP Boxes", "Outline targets through walls") { checked ->

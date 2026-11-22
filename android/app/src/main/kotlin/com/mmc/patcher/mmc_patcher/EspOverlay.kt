@@ -66,10 +66,10 @@ internal class EspOverlay(private val activity: MainActivity) {
                 val p = if (cachedPid > 0) cachedPid else null
                 val b = if (cachedBase > 0L) cachedBase else null
                 if (p != null && b != null) {
-                    targets = collectTargets(p, b)
-                    cam = camera(p, b)
                     val vw = view?.width ?: activity.resources.displayMetrics.widthPixels
                     val vh = view?.height ?: activity.resources.displayMetrics.heightPixels
+                    targets = collectTargets(p, b)
+                    cam = camera(p, b, vw, vh)
                     localRaw = localPosition(p, b)
                     origin = localRaw?.let { pos ->
                         cam?.let { c -> project(pos.first, pos.second, c, vw, vh) }
@@ -114,26 +114,11 @@ internal class EspOverlay(private val activity: MainActivity) {
 
     fun isOff(): Boolean = !boxes && !lines
 
-    /** Player-anchored projection: cocos content pixels fitted to the view. */
+    /** Camera-adaptive projection using the calibrated world transform. */
     private fun project(x: Double, y: Double, c: Camera, viewW: Int, viewH: Int): Pair<Float, Float> {
-        val csf = if (c.csf > 0f) c.csf else 1f
-        val contentW = c.width * csf
-        val contentH = c.height * csf
-        val scale = if (contentW > 0f && contentH > 0f)
-            minOf(viewW / contentW, viewH / contentH) else 1f
-        val anchor = localRaw
-        val ax = anchor?.first ?: x
-        val ay = anchor?.second ?: y
-        val px = viewW / 2f + ((x - ax) * scale).toFloat()
-        val py = viewH / 2f - ((y - ay) * scale).toFloat()
+        val px = c.offsetX + (c.x + x.toFloat() * c.scaleX) * c.viewScale
+        val py = viewH - (c.offsetY + (c.y + y.toFloat() * c.scaleY) * c.viewScale)
         return px to py
-    }
-
-    private fun viewScale(c: Camera, viewW: Int, viewH: Int): Float {
-        val csf = if (c.csf > 0f) c.csf else 1f
-        val contentW = c.width * csf
-        val contentH = c.height * csf
-        return if (contentW > 0f && contentH > 0f) minOf(viewW / contentW, viewH / contentH) else 1f
     }
 
     @SuppressLint("ViewConstructor")
@@ -157,9 +142,8 @@ internal class EspOverlay(private val activity: MainActivity) {
             val player = origin
             val vw = width
             val vh = height
-            val scale = viewScale(c, vw, vh)
-            val kx = scale
-            val ky = scale
+            val sx = c.viewScale * c.scaleX
+            val sy = c.viewScale * c.scaleY
             for (t in targets) {
                 val p = project(t.x, t.y, c, vw, vh)
                 if (p.first < -100f || p.first > vw + 100f || p.second < -100f || p.second > vh + 100f) continue
@@ -172,16 +156,18 @@ internal class EspOverlay(private val activity: MainActivity) {
                     else -> Color.rgb(255, 70, 70)
                 }
 
+                val paintColor = if (t.friendly) (color and 0x00FFFFFF) or 0x46000000 else color
+
                 if (boxes) {
-                    boxPaint.color = color
-                    val w = 40f * scale
-                    val h = 70f * scale
+                    boxPaint.color = paintColor
+                    val w = 40f * sx
+                    val h = 70f * sy
                     canvas.drawRect(p.first - w / 2, p.second - h / 2, p.first + w / 2, p.second + h / 2, boxPaint)
                     dotPaint.color = color
                     canvas.drawCircle(p.first, p.second - h / 2 - 6f, 3f, dotPaint)
                 }
                 if (lines && player != null) {
-                    linePaint.color = color
+                    linePaint.color = paintColor
                     canvas.drawLine(player.first, player.second, p.first, p.second, linePaint)
                 }
             }
