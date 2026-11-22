@@ -43,10 +43,26 @@ internal class EspOverlay(private val activity: MainActivity) {
         ).apply { gravity = Gravity.TOP or Gravity.START }
         wm.addView(view, params)
         running = true
+        var cachedPid = -1
+        var cachedBase = -1L
+        var lastPidCheck = 0L
+        var lastBaseCheck = 0L
         thread = Thread {
             while (running) {
-                val p = MemoryPatcher.findPid()
-                val b = p?.let { MemoryPatcher.findModuleBase(it) }
+                val now = System.currentTimeMillis()
+                if (cachedPid <= 0 || now - lastPidCheck > 500L ||
+                    !java.io.File("/proc/$cachedPid").exists()
+                ) {
+                    lastPidCheck = now
+                    cachedPid = MemoryPatcher.findPid() ?: -1
+                    cachedBase = -1L
+                }
+                if (cachedPid > 0 && (cachedBase <= 0L || now - lastBaseCheck > 1000L)) {
+                    lastBaseCheck = now
+                    cachedBase = MemoryPatcher.findModuleBase(cachedPid) ?: -1L
+                }
+                val p = if (cachedPid > 0) cachedPid else null
+                val b = if (cachedBase > 0L) cachedBase else null
                 if (p != null && b != null) {
                     targets = collectTargets(p, b)
                     cam = camera(p, b)

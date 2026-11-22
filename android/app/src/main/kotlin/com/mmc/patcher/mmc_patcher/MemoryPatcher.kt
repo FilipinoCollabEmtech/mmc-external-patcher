@@ -1,9 +1,11 @@
 package com.mmc.patcher.mmc_patcher
 
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import kotlin.math.atan2
 import kotlin.math.hypot
 
@@ -150,16 +152,56 @@ internal object MemoryPatcher {
         null
     }
 
-    private fun readBytes(pid: Int, address: Long, length: Int): ByteArray? {
-        val mem = openMem(pid, "r") ?: return null
-        return try {
-            mem.seek(address)
+    /** One persistent /proc/<pid>/mem handle per thread; pread instead of open+seek+read+close. */
+    private class MemReader {
+        private var raf: RandomAccessFile? = null
+        private var channel: FileChannel? = null
+        private var pid = -1
+
+        fun bind(target: Int) {
+            if (target == pid && channel != null) return
+            close()
+            pid = target
+            raf = RandomAccessFile("/proc/$target/mem", "r")
+            channel = raf!!.channel
+        }
+
+        fun block(address: Long, length: Int): ByteArray? {
+            val ch = channel ?: return null
             val buf = ByteArray(length)
-            if (mem.read(buf) == length) buf else null
+            var done = 0
+            while (done < length) {
+                val b = ByteBuffer.wrap(buf, done, length - done)
+                val n = try {
+                    ch.read(b, address + done)
+                } catch (_: IOException) {
+                    return null
+                }
+                if (n <= 0) return null
+                done += n
+            }
+            return buf
+        }
+
+        fun close() {
+            runCatching { channel?.close() }
+            runCatching { raf?.close() }
+            channel = null
+            raf = null
+            pid = -1
+        }
+    }
+
+    private val memReader = ThreadLocal.withInitial { MemReader() }
+
+    private fun readBytes(pid: Int, address: Long, length: Int): ByteArray? {
+        val reader = memReader.get()
+        return try {
+            reader.bind(pid)
+            reader.block(address, length)
         } catch (_: Exception) {
+            reader.close()
             null
-        } finally {
-            runCatching { mem.close() }
         }
     }
 
@@ -229,8 +271,12 @@ internal object MemoryPatcher {
         val out = mutableListOf<Long>()
         var guard = 0
         while (elem != 0L && guard++ < 256) {
-            readLong(pid, elem + 0x108)?.let { if (it != 0L) out.add(it) }
-            elem = readLong(pid, elem + 0x120) ?: 0L
+            // One pread covers both obj(+0x108) and next(+0x120).
+            val block = readBytes(pid, elem, 0x128) ?: break
+            val b = ByteBuffer.wrap(block).order(ByteOrder.LITTLE_ENDIAN)
+            val obj = b.getLong(0x108)
+            elem = b.getLong(0x120)
+            if (obj != 0L) out.add(obj)
         }
         return out
     }
@@ -244,23 +290,37 @@ internal object MemoryPatcher {
         return x to y
     }
 
-    /** Drones have a per-type indirection before the shared soldier body. */
+    private const val WORLD_LIMIT = 20000.0
+
+    private fun bodyPosition(pid: Int, body: Long): Pair<Double, Double>? {
+        if (body == 0L) return null
+        val buf = readBytes(pid, body + 0x30, 16) ?: return null
+        val b = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+        val x = b.getDouble(0)
+        val y = b.getDouble(8)
+        if (kotlin.math.abs(x) >= WORLD_LIMIT || kotlin.math.abs(y) >= WORLD_LIMIT) return null
+        return x to y
+    }
+
+    /** Drones: humanoid/enemy go through a controller; hawk/worm point straight at the body. */
     private fun dronePosition(pid: Int, base: Long, obj: Long): Pair<Double, Double>? {
-        val vptr = readLong(pid, obj) ?: 0L
-        val offset = when (vptr - base) {
-            0x1334610L + 0x10, 0x132d1c0L + 0x10 -> 0x200L // HumanoidDrone / Enemy
-            0x13337f0L + 0x10 -> 0x230L                       // HawkDrone
-            0x135a960L + 0x10 -> 0x228L                       // WormDrone
-            else -> null
+        val vptr = readLong(pid, obj) ?: return null
+        val offset: Long
+        val viaController: Boolean
+        when (vptr - base) {
+            0x1334620L, 0x132d1d0L -> { offset = 0x200L; viaController = true }  // humanoid / enemy
+            0x1333800L -> { offset = 0x230L; viaController = false }              // hawk
+            0x135a970L -> { offset = 0x228L; viaController = false }              // worm
+            else -> return null                                                    // no fallback probing
         }
-        val candidates = if (offset != null) listOf(offset) else listOf(0x200L, 0x230L, 0x228L)
-        for (off in candidates) {
-            val holder = readLong(pid, obj + off) ?: continue
-            if (holder == 0L) continue
-            val pos = soldierPosition(pid, holder) ?: continue
-            if (kotlin.math.abs(pos.first) < 20000 && kotlin.math.abs(pos.second) < 20000) return pos
+        val first = readLong(pid, obj + offset) ?: return null
+        if (first == 0L) return null
+        return if (viaController) {
+            val body = readLong(pid, first + 0x1a8) ?: return null
+            bodyPosition(pid, body)
+        } else {
+            bodyPosition(pid, first)
         }
-        return null
     }
 
     fun localController(pid: Int, base: Long): Long? =
@@ -290,7 +350,8 @@ internal object MemoryPatcher {
         // Multiplayer / LAN players: *(*(base+0x13bf260))
         for (ctrl in dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)) {
             if (!seen.add(ctrl)) continue
-            val pos = soldierPosition(pid, ctrl) ?: continue
+            val body = readLong(pid, ctrl + 0x1a8) ?: continue
+            val pos = bodyPosition(pid, body) ?: continue
             out.add(EspTarget(pos.first, pos.second, KIND_PLAYER, 0f))
         }
         return out
