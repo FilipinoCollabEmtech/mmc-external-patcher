@@ -37,10 +37,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var base: Long? = null
     private var debug: DebugOverlay? = null
     private var espDebug: EspDebugOverlay? = null
-    private var espPid: Int? = null
-    private var espBase: Long? = null
-    private var espBoxes = false
-    private var espLines = false
+    private var esp: EspOverlay? = null
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
     private val states = LinkedHashMap<String, Boolean>()
@@ -117,7 +114,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
         icon = null
         panel = null
         expanded = false
-        espPid?.let { p -> espBase?.let { b -> MemoryPatcher.setEspFlags(p, b, false, false) } }
+        esp?.hide()
+        esp = null
         debug?.hide()
         debug = null
         espDebug?.hide()
@@ -559,26 +557,14 @@ internal class FloatingMenu(private val activity: MainActivity) {
     }
 
     private fun setEsp(boxes: Boolean? = null, lines: Boolean? = null) {
-        if (boxes != null) espBoxes = boxes
-        if (lines != null) espLines = lines
-        if (!ensureAttached()) {
-            toast("Launch MMC first")
-            return
+        if (esp == null) esp = EspOverlay(activity)
+        if (boxes != null) esp?.setBoxes(boxes)
+        if (lines != null) esp?.setLines(lines)
+        if (esp?.isOff() == true) {
+            esp?.hide()
+            esp = null
         }
-        val p = pid!!
-        val b = base!!
-        if (espPid != p || espBase != b) {
-            if (!MemoryPatcher.installInternalEsp(p, b)) {
-                PatchLogger.log("ESP", "install failed pid=$p base=0x${b.toString(16)}")
-                toast("ESP install failed")
-                return
-            }
-            PatchLogger.log("ESP", "hook installed pid=$p base=0x${b.toString(16)}")
-            espPid = p
-            espBase = b
-        }
-        PatchLogger.log("ESP", "flags boxes=$espBoxes lines=$espLines")
-        MemoryPatcher.setEspFlags(p, b, espBoxes, espLines)
+        PatchLogger.log("ESP", "external overlay boxes=$boxes lines=$lines")
     }
 
     private fun refreshPanel() {
