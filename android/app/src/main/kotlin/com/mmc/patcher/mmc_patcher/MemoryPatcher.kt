@@ -775,10 +775,10 @@ internal object MemoryPatcher {
             sb.appendLine("scene missing - cannot walk hierarchy")
         }
 
-        val csf = (c?.csf ?: 1f).let { if (it > 0f) it else 1f }
-        val scale = if (c != null && c.width * csf > 0f && c.height * csf > 0f)
-            minOf(viewW / (c.width * csf), viewH / (c.height * csf)) else 1f
-        sb.appendLine("projScale=$scale csf=$csf")
+        val projCsf = (c?.csf ?: 1f).let { if (it > 0f) it else 1f }
+        val scale = if (c != null && c.width * projCsf > 0f && c.height * projCsf > 0f)
+            minOf(viewW / (c.width * projCsf), viewH / (c.height * projCsf)) else 1f
+        sb.appendLine("projScale=$scale csf=$projCsf")
         fun screen(x: Double, y: Double, ax: Double, ay: Double): String {
             val px = viewW / 2f + ((x - ax) * scale).toFloat()
             val py = viewH / 2f - ((y - ay) * scale).toFloat()
