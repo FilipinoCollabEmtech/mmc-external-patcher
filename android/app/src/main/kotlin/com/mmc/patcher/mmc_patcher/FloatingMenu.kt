@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -19,6 +20,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.applyGroup
@@ -42,6 +44,11 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
     private val states = LinkedHashMap<String, Boolean>().apply { put("teamCheck", MemoryPatcher.teamCheck) }
+
+    /** Slider values persist across panel rebuilds the same way toggles do. */
+    private val sliderValues = LinkedHashMap<String, Float>().apply {
+        put("pov", MemoryPatcher.povPercent.toFloat())
+    }
 
     private val accent = Color.rgb(255, 92, 92)
     private val bg = Color.argb(248, 17, 18, 25)
@@ -363,6 +370,13 @@ internal class FloatingMenu(private val activity: MainActivity) {
             true
         })
 
+        container.addView(sectionTitle("VIEW  /  CAMERA"))
+        container.addView(sliderRow("pov", "⤢", "Camera POV", "Wider view - ESP follows", 100, 160, 5, "%") { pct ->
+            val ok = MemoryPatcher.setPov(pct)
+            if (!ok) toast("Saved - applies when MMC is running")
+            true // keep the value even before the game launches
+        })
+
         container.addView(sectionTitle("DIAGNOSTICS"))
         container.addView(toggleRow("debug", "i", "Live Debug Data", "Show pointers and target values") { checked ->
             if (checked) {
@@ -589,6 +603,91 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
         paint()
         return row
+    }
+
+    /**
+     * Compact SeekBar row for numeric values. The write fires only on release so
+     * dragging does not spam memory writes; the value persists in [sliderValues]
+     * even when the game is not running.
+     */
+    @SuppressLint("SetTextI18n")
+    private fun sliderRow(
+        key: String,
+        glyph: String,
+        label: String,
+        subtitle: String,
+        min: Int,
+        max: Int,
+        step: Int,
+        unit: String,
+        onChange: (Int) -> Boolean,
+    ): View {
+        var current = (sliderValues[key] ?: min.toFloat()).toInt().coerceIn(min, max)
+        val icon = TextView(activity).apply {
+            text = glyph
+            gravity = Gravity.CENTER
+            caption(12f, Color.WHITE, bold = true)
+            minimumWidth = dp(32)
+            minimumHeight = dp(32)
+        }
+        val texts = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = dp(11)
+            }
+            addView(TextView(activity).apply { text = label; caption(13f, textPrimary, bold = true) })
+            addView(TextView(activity).apply { text = subtitle; caption(10f, textDim) })
+        }
+        val valueText = TextView(activity).apply {
+            caption(11f, online, bold = true)
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.END
+            minimumWidth = dp(48)
+        }
+        fun paintValue(v: Int) { valueText.text = "$v$unit" }
+        paintValue(current)
+
+        val head = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(icon)
+            addView(texts)
+            addView(valueText)
+        }
+        val seek = SeekBar(activity).apply {
+            max = (max - min) / step
+            progress = (current - min) / step
+            progressTintList = ColorStateList.valueOf(accent)
+            thumbTintList = ColorStateList.valueOf(accent)
+        }
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                paintValue(min + p * step)
+            }
+            override fun onStartTrackingTouch(s: SeekBar) = Unit
+            override fun onStopTrackingTouch(s: SeekBar) {
+                val v = min + s.progress * step
+                sliderValues[key] = v.toFloat()
+                onChange(v)
+                paintValue(v)
+                PatchLogger.log("SLIDER", "$label -> $v$unit")
+            }
+        })
+        return LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(11), dp(9), dp(11), dp(9))
+            minimumHeight = dp(66)
+            background = rounded(cardOff, dp(13).toFloat(), stroke)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(7) }
+            addView(head)
+            addView(seek, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(2) })
+        }
     }
 
     private fun setEsp(boxes: Boolean? = null, lines: Boolean? = null) {

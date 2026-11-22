@@ -266,9 +266,8 @@ internal object MemoryPatcher {
         }
     }
 
-    private fun writeFloat(pid: Int, address: Long, value: Float) {
+    private fun writeFloat(pid: Int, address: Long, value: Float): Boolean =
         writeBytes(pid, address, ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array())
-    }
 
     private fun writeViaShell(pid: Int, address: Long, bytes: ByteArray): Boolean {
         val octal = bytes.joinToString("") { "\\${(it.toInt() and 0xff).toString(8).padStart(3, '0')}" }
@@ -477,8 +476,10 @@ internal object MemoryPatcher {
                 kotlin.math.abs(it.wx - width / 2f) < 4f &&
                 kotlin.math.abs(it.wy - height / 2f) < 4f
         }.maxByOrNull { it.depth }
-        val ax = design?.sx ?: 1f
-        val ay = design?.sy ?: 1f
+        // The game zooms by scaling a world node; scale the ESP world transform by
+        // the same factor so boxes stay on target when Camera POV is widened.
+        val ax = (design?.sx ?: 1f) * povScale
+        val ay = (design?.sy ?: 1f) * povScale
 
         val bx = (anchorX - ox) / s - ax * local.first.toFloat()
         val by = (viewH - anchorY - oy) / s - ay * local.second.toFloat()
@@ -512,6 +513,176 @@ internal object MemoryPatcher {
         val x = readFloat(pid, node + 0x2c) ?: return null
         val y = readFloat(pid, node + 0x30) ?: return null
         return x to y
+    }
+
+    // ---- weapon diagnostics: offsets verified against cocos2dcpp_disasm.txt ----
+    private const val LC_PRIMARY = 0x1c8L
+    private const val LC_SECONDARY = 0x1d0L
+    private const val LC_DUAL = 0x1d8L
+    private const val LC_SIDE = 0x1e0L
+
+    private const val W_TYPE = 0x338L
+    private const val W_DAMAGE = 0x320L
+    private const val W_RANGE_BASE = 0x322L
+    private const val W_RANGE_MOD = 0x26cL
+    private const val W_SPEED_BASE = 0x2b4L
+    private const val W_SPEED_MOD = 0x270L
+    private const val W_RATE = 0x324L
+    private const val W_ROUNDS = 0x318L
+    private const val W_ACCURACY = 0x31cL
+    private const val W_AMMO = 0x360L
+    private const val W_CLIP = 0x362L
+    private const val W_AMMO_CAP = 0x330L
+    private const val W_MELEE_LEN = 0x2a0L
+    private const val W_MELEE_DMG = 0x32cL
+    private const val W_RELOAD_TIMER = 0x3bcL
+    private const val W_RELOAD_MOD = 0x27cL
+    private const val W_IS_RELOADING = 0x285L
+    private const val W_IS_DUAL = 0x288L
+
+    private val WEAPON_NAMES = arrayOf(
+        "?", "MACHETE", "FRAGNADE", "DEAGLE", "MAGNUM", "UZI", "MP5", "AK47", "M16",
+        "SHOTGUN", "M93BA", "SMAW", "ROCKET", "RIOTSHIELD", "HEALTHPACK", "BOOSTTANK",
+        "M14", "PHASR", "GDEAGLE", "FLAMETHROWER", "GASNADE", "EMP", "?", "PROXYNADE",
+        "SAW", "SAWGUN", "TAVOR", "MINIGUN", "TEC9", "RG6", "EMPNADE", "XM8",
+        "MORTAR", "FLAGBLUE", "FLAGORANGE", "BOMBBLUE", "BOMBORANGE", "AA12", "?", "M1881",
+    )
+
+    // Object vptr = _ZTV + 0x10, so the key is readLong(w) - base - 0x10.
+    private val WEAPON_VTABLES = mapOf(
+        0x1316eb0L to "AA12", 0x1317c20L to "AK47", 0x1323440L to "BOMBBLUE",
+        0x1323b70L to "BOMBORANGE", 0x132aaf0L to "DEAGLE", 0x132ba30L to "EMP",
+        0x132c160L to "EMPNADE", 0x132e190L to "FLAGBLUE", 0x132e8c0L to "FLAGORANGE",
+        0x132f360L to "FLAMETHROWER", 0x132fa90L to "FRAGNADE", 0x1331ea0L to "GASNADE",
+        0x13325d0L to "GDEAGLE", 0x13390f0L to "M16", 0x1339820L to "M1881",
+        0x1339f50L to "M93BA", 0x133a680L to "MACHETE", 0x133adb0L to "MAGNUM",
+        0x133b4e0L to "MINIGUN", 0x133bc10L to "MORTAR", 0x133c340L to "MP5",
+        0x1341af0L to "PHASR", 0x134a320L to "RG6", 0x134aa50L to "RIOTSHIELD",
+        0x134b180L to "ROCKET", 0x134e770L to "SAW", 0x134eec0L to "SAWGUN",
+        0x134f5f0L to "SHOTGUN", 0x134fd20L to "SMAW", 0x1356090L to "TAVOR",
+        0x13567c0L to "TEC9", 0x1359560L to "UZI", 0x135ae30L to "XM8",
+        0x135a180L to "Weapon",
+    )
+
+    private fun readU16(pid: Int, address: Long): Int? = readInt(pid, address)?.and(0xffff)
+    private fun readI16(pid: Int, address: Long): Int? = readU16(pid, address)?.let {
+        if (it >= 0x8000) it - 0x10000 else it
+    }
+
+    /** Multi-line weapon dump for the diagnostics overlays and COPY LOGS. */
+    fun weaponInfo(pid: Int, base: Long): String {
+        fun hx(v: Long?) = v?.let { "0x${it.toString(16)}" } ?: "null"
+        val sb = StringBuilder()
+        sb.appendLine("=== WEAPON ===")
+        val lc = localController(pid, base)
+        if (lc == null || lc == 0L) {
+            sb.appendLine("localCtrl=null")
+            return sb.toString()
+        }
+        sb.appendLine("lc=${hx(lc)}")
+
+        fun dump(label: String, slot: Long): Long? {
+            val w = readLong(pid, lc + slot) ?: 0L
+            if (w == 0L) {
+                sb.appendLine("$label=null")
+                return null
+            }
+            val type = readInt(pid, w + W_TYPE)
+            val idName = type?.let { WEAPON_NAMES.getOrNull(it) } ?: "?"
+            val vptr = readLong(pid, w)
+            val cls = vptr?.let { WEAPON_VTABLES[it - base - 0x10] } ?: "?"
+            val dmg = readU16(pid, w + W_DAMAGE)
+            val rangeBase = readU16(pid, w + W_RANGE_BASE)
+            val rangeMod = readFloat(pid, w + W_RANGE_MOD)
+            val range = if (rangeBase != null && rangeMod != null) (rangeBase * rangeMod).toInt() else null
+            val speedBase = readInt(pid, w + W_SPEED_BASE)
+            val speedMod = readFloat(pid, w + W_SPEED_MOD)
+            val speed = if (speedBase != null && speedMod != null) (speedBase * speedMod).toInt() else null
+
+            sb.appendLine("$label w=${hx(w)} vptr-base=${hx(vptr?.minus(base))} id=$type name=$idName cls=$cls")
+            sb.appendLine("  dmg=$dmg range=$range bulletSpeed=$speed " +
+                "rate=${readFloat(pid, w + W_RATE)} rpf=${readU16(pid, w + W_ROUNDS)} " +
+                "acc=${readFloat(pid, w + W_ACCURACY)}")
+            sb.appendLine("  bulletLen=${readInt(pid, w + W_MELEE_LEN)} meleeDmg=${readU16(pid, w + W_MELEE_DMG)} " +
+                "clip=${readI16(pid, w + W_CLIP)} ammo=${readI16(pid, w + W_AMMO)} cap=${readU16(pid, w + W_AMMO_CAP)}")
+            sb.appendLine("  reloading=${readBytes(pid, w + W_IS_RELOADING, 1)?.get(0)?.toInt()} " +
+                "reloadT=${readFloat(pid, w + W_RELOAD_TIMER)} reloadMod=${readFloat(pid, w + W_RELOAD_MOD)} " +
+                "dual=${readBytes(pid, w + W_IS_DUAL, 1)?.get(0)?.toInt()}")
+            return w
+        }
+
+        val primary = dump("primary", LC_PRIMARY)
+        dump("secondary", LC_SECONDARY)
+        val dual = dump("dual", LC_DUAL)
+        dump("side", LC_SIDE)
+        sb.appendLine("active=${when {
+            primary != null -> "primary"
+            dual != null -> "dual"
+            else -> "none"
+        }}")
+        return sb.toString()
+    }
+
+    // ---- camera POV (zoom-out) -------------------------------------------
+    // HUD::setZoomLevel writes lc+0x2b4 on zoom/weapon change; updateStep and
+    // getViewScaleV4 read it every frame. Lower value = wider view.
+    private const val POV_LC_FIELD = 0x2b4L
+    private const val POV_LC_SMOOTH = 0x29cL
+    private const val POV_LC_LEGACY = 0x298L
+    private const val POV_MIN = 100
+    private const val POV_MAX = 160
+
+    @Volatile var povPercent: Int = POV_MIN
+        private set
+    @Volatile var povScale: Float = 1f          // 100% -> 1.0, 160% -> 0.625
+        private set
+    @Volatile private var povKeeper = false
+    private var povThread: Thread? = null
+
+    private fun applyPov(): Boolean {
+        val pid = findPid() ?: return false
+        val base = findModuleBase(pid) ?: return false
+        val lc = localController(pid, base).takeIf { it != 0L } ?: return false
+        val z = povScale
+        return writeFloat(pid, lc + POV_LC_FIELD, z) and
+            writeFloat(pid, lc + POV_LC_SMOOTH, z) and
+            writeFloat(pid, lc + POV_LC_LEGACY, z)
+    }
+
+    fun setPov(percent: Int): Boolean {
+        val pct = percent.coerceIn(POV_MIN, POV_MAX)
+        povPercent = pct
+        povScale = 100f / pct
+        val ok = applyPov()
+        if (pct == POV_MIN) stopPovKeeper() else startPovKeeper()
+        PatchLogger.log("POV", "set pct=$pct k=${"%.4f".format(povScale)} ok=$ok")
+        return ok
+    }
+
+    private fun startPovKeeper() {
+        if (povKeeper) return
+        povKeeper = true
+        povThread = Thread {
+            while (povKeeper) {
+                try {
+                    if (povPercent != POV_MIN) applyPov()
+                } catch (_: Throwable) {
+                    // Transient process/scene change - retry next tick.
+                }
+                try {
+                    Thread.sleep(150L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }.apply { isDaemon = true; name = "pov-keeper"; start() }
+    }
+
+    private fun stopPovKeeper() {
+        povKeeper = false
+        povThread?.interrupt()
+        try { povThread?.join(200) } catch (_: InterruptedException) {}
+        povThread = null
     }
 
     /** Multi-line dump of every pointer in the ESP/aim chain, for the debug overlay. */
@@ -554,6 +725,7 @@ internal object MemoryPatcher {
         val cam = camera(pid, base, dvw, dvh)
         val targets = collectTargets(pid, base)
         sb.appendLine("cam=${cam?.x?.toInt()},${cam?.y?.toInt()} targets=${targets.size}")
+        sb.append(weaponInfo(pid, base))
         return sb.toString()
     }
 
@@ -1123,6 +1295,10 @@ internal object MemoryPatcher {
             "space=${hx(readLong(pid, ld + 0x40))} result=${hx(readLong(pid, ld + 0x48))} " +
             "start=${losOrigin.first.toInt()},${losOrigin.second.toInt()} " +
             "end=${losTarget.first.toInt()},${losTarget.second.toInt()}")
+        val povLc = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
+        sb.appendLine("POV: pct=$povPercent k=${"%.4f".format(povScale)} lc=${hx(povLc)} " +
+            "zoom=${if (povLc != null) readFloat(pid, povLc + POV_LC_FIELD) else null}")
+        sb.append(weaponInfo(pid, base))
         return sb.toString()
     }
 }
