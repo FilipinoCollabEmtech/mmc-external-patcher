@@ -1347,127 +1347,35 @@ internal object MemoryPatcher {
             logPredict("AIM", "paused - scene settling or invalid controller")
             return Float.NaN
         }
-        val body = soldierPosition(pid, lc) ?: return Float.NaN
-        val w = activeWeapon(pid, lc)
-        val speed = w?.let { bulletSpeedOf(pid, it) } ?: 0.0
-        val speedRaw = w?.let { bulletSpeedRawOf(pid, it) } ?: Double.NaN
-        val range = w?.let { effectiveRangeOf(pid, it) } ?: 0.0
-        val validSpeed = speed > 0.0 && finite(speed)
-        val design = w?.let { designFiringOffsetOf(pid, it) }
-
-        val hostiles = collectTargets(pid, base, withVelocity = true).filter { !it.friendly }
-        // Rotation reference for the design-offset muzzle mode: nearest target from
-        // the body. Fixed-offset mode (the default) does not depend on this.
-        val ref = hostiles.minByOrNull { hypot(it.x - body.first, it.y - body.second) }
-        val refDist = ref?.let { hypot(it.x - body.first, it.y - body.second) } ?: 0.0
-        val refRad = if (ref != null) atan2(-(ref.y - body.second), ref.x - body.first) else 0.0
-        val refDeg = (Math.toDegrees(refRad)).toFloat().let { if (it < 0f) it + 360f else it }
-        // Bullets originate at the weapon firing point, not the physics body centre.
-        val origin = firingOrigin(pid, w, body, refDeg, refDist)
-
+        // Direct aim: no velocity lead, no muzzle offset, no intercept solve.
+        val origin = soldierPosition(pid, lc) ?: return Float.NaN
         zeroSway(pid, lc)
         losOrigin = origin
         var best = 4000.0
         var found = Float.NaN
-        var chosenLeadX = Double.NaN
-        var chosenLeadY = Double.NaN
-        var snap = PredictSnapshot(
-            weapon = weaponNameOf(pid, w), range = range, speed = speed,
-            bodyX = body.first, bodyY = body.second,
-            originX = origin.first, originY = origin.second,
-            muzzleSrc = if (muzzleUseDesign) "design(rot)" else "fixed",
-            designX = design?.first ?: Double.NaN, designY = design?.second ?: Double.NaN,
-            speedRaw = speedRaw, speedScale = BULLET_SPEED_SCALE,
-            validSpeed = validSpeed, accelApplied = LEAD_ACCEL_GAIN != 0.0,
-        )
-        for (t in hostiles) {
-            val rawDist = hypot(t.x - origin.first, t.y - origin.second)
-            if (rawDist < 10.0 || rawDist >= best) continue
-            best = rawDist
-            // Invalid stats (EMP/grenade expose speed=1): intercept() returns the
-            // raw target when speed<=0, so no fabricated 1.5 s flight is aimed at.
-            val lead = intercept(
-                origin.first, origin.second, t.x, t.y,
-                t.vx, t.vy, t.ax * LEAD_ACCEL_GAIN, t.ay * LEAD_ACCEL_GAIN, speed,
-            )
-            val dx = lead.x - origin.first
-            val dy = lead.y - origin.second
+        var snap = PredictSnapshot(weapon = weaponNameOf(pid, activeWeapon(pid, lc)))
+        for (t in collectTargets(pid, base)) {
+            if (t.friendly) continue
+            val dx = t.x - origin.first
+            val dy = t.y - origin.second
+            val dist = hypot(dx, dy)
+            if (dist < 10.0 || dist >= best) continue
+            best = dist
             var deg = (atan2(-dy, dx) * 180.0 / Math.PI).toFloat()
             if (deg < 0f) deg += 360f
             found = deg
-            chosenLeadX = lead.x
-            chosenLeadY = lead.y
-            // Keep the LOS probe on the target's real position: Wall Check semantics unchanged.
             losTarget = t.x to t.y
             snap = snap.copy(
-                targetKind = t.kind, rawDist = rawDist, vx = t.vx, vy = t.vy, velSrc = t.velSrc,
-                ax = t.ax, ay = t.ay, travel = lead.seconds, leadAngle = deg,
-                predictedDist = hypot(dx, dy), iterations = lead.iterations,
-                leadX = lead.x - t.x, leadY = lead.y - t.y,
-                clamped = lead.seconds >= MAX_LEAD_SECONDS - 1e-6,
-                targetX = t.x, targetY = t.y, targetKey = targetKey(t),
+                targetKind = t.kind, rawDist = dist, predictedDist = dist,
+                leadAngle = deg, targetX = t.x, targetY = t.y, targetKey = targetKey(t),
             )
         }
-
-        // ---- DIRECTION SANITY CHECK ----
-        // The game maps our degrees to a world velocity with rad = -deg*PI/180 and
-        // (cos(rad), sin(rad)). Verify that vector still points from the body at the
-        // chosen intercept. If a close target put the rotated design muzzle PAST it,
-        // origin->lead reverses and the derived angle is 180 degrees off. The body is
-        // independent of that origin, so its direction is the authoritative fallback.
-        val finalDeg: Float
-        var flip = AimFlipSnapshot()
-        if (!found.isNaN() && finite(chosenLeadX) && finite(chosenLeadY)) {
-            val ex = chosenLeadX - body.first
-            val ey = chosenLeadY - body.second
-            val magE = hypot(ex, ey)
-            if (magE > 1.0) {
-                val (rad, gvx, gvy) = gameVelocity(found)
-                // gvx/gvy are unit length: this dot is the cosine of the error angle.
-                val dot = (gvx * ex + gvy * ey) / magE
-                val fallback = normalizeDeg(atan2(-ey, ex) * 180.0 / Math.PI)
-                val flipped = dot < 0.0  // mismatch greater than 90 degrees
-                finalDeg = if (flipped) fallback else found
-                flip = AimFlipSnapshot(
-                    targetX = snap.targetX, targetY = snap.targetY,
-                    expectedX = ex, expectedY = ey,
-                    originDx = chosenLeadX - origin.first,
-                    originDy = chosenLeadY - origin.second,
-                    computedDeg = found, gameRad = rad,
-                    gameVelX = gvx, gameVelY = gvy, dot = dot,
-                    flipped = flipped, fallbackDeg = fallback,
-                )
-                if (flipped) {
-                    logPredict("AIMFLIP",
-                        "origin overshoot reversed aim: tgtDir=${"%.1f,%.1f".format(ex, ey)} " +
-                            "originDir=${"%.1f,%.1f".format(chosenLeadX - origin.first, chosenLeadY - origin.second)} " +
-                            "deg=${"%.1f".format(found)} rad=${"%.4f".format(rad)} " +
-                            "gameVel=${"%.3f,%.3f".format(gvx, gvy)} dot=${"%.3f".format(dot)} " +
-                            "fallback=${"%.1f".format(fallback)}")
-                }
-            } else {
-                finalDeg = found
-            }
-        } else {
-            finalDeg = found
-        }
-        aimFlip = flip
         aimPredict = snap
+        aimFlip = AimFlipSnapshot()
         logPredict("AIM",
-            "pred w=${snap.weapon} speed=${"%.0f".format(speed)} range=${"%.0f".format(range)} " +
-                "tgt=${snap.targetKind} d=${"%.0f".format(snap.rawDist)} " +
-                "v=${"%.0f".format(snap.vx)},${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
-                "tt=${"%.3f".format(snap.travel)} lead=${"%.0f".format(snap.predictedDist)} " +
-                "deg=${"%.1f".format(snap.leadAngle)} flip=${if (flip.flipped) 1 else 0} " +
-                "it=${snap.iterations}")
-        logPredict("AIMACC",
-            "origin=${"%.0f,%.0f".format(origin.first, origin.second)} " +
-                "body=${"%.0f,%.0f".format(body.first, body.second)} " +
-                "muzzle=${snap.muzzleSrc} design=${design?.let { "%.1f,%.1f".format(it.first, it.second) } ?: "-"} " +
-                "speedRaw=${"%.2f".format(speedRaw)} scale=$BULLET_SPEED_SCALE " +
-                "flight=${"%.3f".format(snap.travel)} leadVec=${"%.1f,%.1f".format(snap.leadX, snap.leadY)} " +
-                "valid=$validSpeed clamp=${snap.clamped} accel=$LEAD_ACCEL_GAIN")
-        return finalDeg
+            "direct w=${snap.weapon} tgt=${snap.targetKind} d=${"%.0f".format(snap.rawDist)} " +
+                "deg=${"%.1f".format(found)}")
+        return found
     }
 
     fun toggleAimlock(enable: Boolean): Boolean {
@@ -1488,7 +1396,7 @@ internal object MemoryPatcher {
             }
 
             aimRunning = true
-            PatchLogger.log("AIM", "predictive aimlock enabled (iterative lead ${LEAD_ITERATIONS}x)")
+            PatchLogger.log("AIM", "direct aimlock enabled")
             aimThread = Thread {
                 while (aimRunning) {
                     val p = findPid()
@@ -2595,40 +2503,13 @@ internal object MemoryPatcher {
             "legacy=${if (povLc != null) f4(readFloat(pid, povLc + POV_LC_LEGACY)) else "?"}")
         fun f1(v: Double) = "%.1f".format(v)
         val a = aimPredict
-        sb.appendLine("PREDICT AIM: w=${a.weapon} speed=${f1(a.speed)} range=${f1(a.range)} " +
-            "tgt=${a.targetKind} d=${f1(a.rawDist)} v=${f1(a.vx)},${f1(a.vy)}[${a.velSrc}] " +
-            "a=${f1(a.ax)},${f1(a.ay)} tt=${"%.3f".format(a.travel)} lead=${f1(a.predictedDist)} " +
-            "deg=${"%.1f".format(a.leadAngle)} it=${a.iterations}")
-        // AIM ACCURACY: every input to the ballistic solution plus the FILL knobs.
-        sb.appendLine("=== AIM ACCURACY ===")
-        sb.appendLine("  origin=${f1(a.originX)},${f1(a.originY)} body=${f1(a.bodyX)},${f1(a.bodyY)} " +
-            "src=${a.muzzleSrc} off=${f1(a.originX - a.bodyX)},${f1(a.originY - a.bodyY)}")
-        sb.appendLine("  design=${a.designX.let { if (finite(it)) "%.1f".format(it) else "-" }}," +
-            "${a.designY.let { if (finite(it)) "%.1f".format(it) else "-" }} " +
-            "w+0x2d0/0x2d8 (weapon-local doubles)")
-        sb.appendLine("  speed=${f1(a.speed)} raw=${a.speedRaw.let { if (finite(it)) "%.2f".format(it) else "-" }} " +
-            "scale=$BULLET_SPEED_SCALE valid=${a.validSpeed} " +
-            "(getBulletSpeed int[0x2b4]*f32[0x270], disasm:1239172)")
-        sb.appendLine("  flight=${"%.3f".format(a.travel)} clamped=${a.clamped} " +
-            "leadVec=${f1(a.leadX)},${f1(a.leadY)} it=${a.iterations} accelGain=$LEAD_ACCEL_GAIN")
-        sb.appendLine("  FILL muzzleFixed=${f1(muzzleOffsetX)},${f1(muzzleOffsetY)} " +
-            "useDesign=$muzzleUseDesign designScale=$muzzleDesignScale - " +
-            "calibrate: setMuzzleOffset(dx,dy) / setMuzzleUseDesign(on,scale)")
-        sb.appendLine("  FILL speedScale=$BULLET_SPEED_SCALE accelGain=$LEAD_ACCEL_GAIN - " +
-            "only raise after live A/B test against a stationary target")
-        // AIM FLIP: the written degrees -> game velocity mapping and its direction check.
-        val af = aimFlip
-        sb.appendLine("=== AIM FLIP ===")
-        sb.appendLine("  target=${f1(af.targetX)},${f1(af.targetY)} " +
-            "expectedDir(body->lead)=${f1(af.expectedX)},${f1(af.expectedY)} " +
-            "originDir(origin->lead)=${f1(af.originDx)},${f1(af.originDy)}")
-        sb.appendLine("  computedDeg=${"%.1f".format(af.computedDeg)} " +
-            "gameRad=${"%.4f".format(af.gameRad)} " +
-            "gameVel(cos,sin)=${"%.3f,%.3f".format(af.gameVelX, af.gameVelY)}")
-        sb.appendLine("  dot=${"%.3f".format(af.dot)} flipped=${af.flipped} " +
-            "fallbackDeg=${"%.1f".format(af.fallbackDeg)} " +
-            "writtenDeg=${"%.1f".format(af.writtenDeg)} " +
-            "(rad=-deg*PI/180, dot<0 means >90deg off)")
+        sb.appendLine("DIRECT AIM: w=${a.weapon} tgt=${a.targetKind} " +
+            "d=${f1(a.rawDist)} key=${a.targetKey} " +
+            "deg=${f1(a.leadAngle.toDouble())}")
+        sb.appendLine("=== AIM TARGET ===")
+        sb.appendLine("  weapon=${a.weapon} key=${a.targetKey} kind=${a.targetKind} " +
+            "rawDist=${f1(a.rawDist)} angleDeg=${"%.1f".format(a.leadAngle)}")
+        sb.appendLine("  direct aim - no lead/velocity/muzzle model in use")
         val g = trigPredict
         sb.appendLine("PREDICT TRIG: w=${g.weapon} range=${f1(g.range)} speed=${f1(g.speed)} " +
             "tgt=${g.targetKind} d=${f1(g.rawDist)} v=${f1(g.vx)},${f1(g.vy)}[${g.velSrc}] " +
