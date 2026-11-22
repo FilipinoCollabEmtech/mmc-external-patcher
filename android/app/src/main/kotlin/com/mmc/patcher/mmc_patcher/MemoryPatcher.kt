@@ -6,6 +6,10 @@ import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.text.SimpleDateFormat
+import java.util.ArrayDeque
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.atan2
 import kotlin.math.hypot
@@ -25,6 +29,7 @@ internal data class EspTarget(
     val friendly: Boolean = false, val teamId: Int = -1,
     var vx: Double = 0.0, var vy: Double = 0.0, var velSrc: String = "-",
     var ax: Double = 0.0, var ay: Double = 0.0,
+    var crouched: Boolean = false, val ctrl: Long = 0L,
 )
 internal data class Camera(
     val x: Float, val y: Float,           // B: world offset in cocos points
@@ -63,6 +68,47 @@ internal object MemoryPatcher {
     private const val DIRECTOR_GLOBAL = 0x13ec228L
     private const val TEAM_ID_OFFSET = 0x144L
     private const val LOCAL_TEAM_GLOBAL = 0x13bede8L
+
+    // SoldierController::isDucked 0x8e2b94 reads byte [this+0x1ea] & 1
+    // (cocos2dcpp_disasm.txt:1133378). SoldierController::setDucked 0x8e2bb4
+    // writes the same byte (disasm:1133393). SoldierRemoteController::setDucked
+    // 0x8f70b4 also stores 13 (0xd) into [this+0x214] when ducked
+    // (disasm:1154595-1154597) - used only as a fallback when the byte is unreadable.
+    private const val CTRL_DUCKED = 0x1eaL
+    private const val CTRL_DUCKED_SHAPE = 0x214L
+    private const val DUCKED_SHAPE_VALUE = 13
+
+    // ---- multiplayer join capture (READ-ONLY; external /proc/<pid>/mem) ----
+    // All offsets below come from cocos2dcpp_disasm.txt / cocos2dcpp_dynsyms.txt.
+    // NetworkManager singleton: dynsyms file line 24357 `m_pInstance` @0x13d9540;
+    // sharedNetworkManager() (disasm 0x713478-0x713480) reads *(0x13c0528) to get the
+    // address of that slot, then dereferences it. Both paths are sampled and logged so a
+    // build with a different relocation still yields a usable trace.
+    private const val NM_INSTANCE_GLOBAL = 0x13d9540L
+    private const val NM_ACCESSOR_SLOT_GLOBAL = 0x13c0528L
+    // ZTV14NetworkManager @0x1341070 (dynsyms file line 7179) + 0x10 = expected vptr.
+    private const val NM_VTABLE = 0x1341080L
+    private const val NM_PEER_DICT = 0x128L          // getPeerCount() disasm 0x71918c -> CCDictionary*
+    private const val NM_LOCAL_PEER_ID = 0x160L      // getLocalPeerID() disasm 0x71a154 -> std::string
+    private const val NM_LEADER_PEER_ID = 0x178L     // getLeaderPeerID() disasm 0x71e06c -> std::string
+    private const val NM_SESSION = 0x3f8L            // onlineMatchExists() disasm 0x71d2f4
+    private const val NM_RAKNET = 0x400L             // getRakNetInstance() disasm 0x718824
+    private const val NM_CONNECTED = 0x418L          // isConnected() disasm 0x71eff4
+    private const val NM_WAS_INVITED = 0x419L        // getWasInvited() disasm 0x71f640
+    private const val NM_IN_GAME = 0x41aL            // isInGame() disasm 0x71dff0
+    private const val NM_MAX_PLAYERS = 0x41cL        // getMaxPlayers() disasm 0x71df40
+    private const val NM_SESSION_TO_JOIN = 0x428L    // getSessionToJoin() disasm 0x71d784 -> std::string
+    // Each global below holds a pointer to the scalar the getter returns.
+    private const val NET_CONN_TYPE_GLOBAL = 0x13bf448L    // getConnectionType() disasm 0x71f620
+    private const val NET_REQ_SESSION_GLOBAL = 0x13be530L  // isRequestingSession() disasm 0x74327c
+    private const val NET_SESSION_DONE_GLOBAL = 0x13c0e58L // hasCompletedSessionRequest() disasm 0x74317c
+    private const val NET_QUICKPLAY_POP_GLOBAL = 0x13c13b0L// getQuickplayPopulation() disasm 0x74233c
+    private const val NET_SHOW_ASK_GLOBAL = 0x13bf640L     // getShowAskButton() disasm 0x7422cc
+
+    private const val JOIN_MAX_LINES = 600
+    private const val JOIN_SAMPLE_MS = 50L
+    private const val JOIN_HEARTBEAT_MS = 2000L
+    private const val JOIN_MAX_LOGCAT = 200
 
     @Volatile var teamCheck = true
         private set
@@ -364,6 +410,16 @@ internal object MemoryPatcher {
     fun localController(pid: Int, base: Long): Long? =
         readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
 
+    /** Crouch state for a remote SoldierController. Byte read is authoritative. */
+    private fun isDucked(pid: Int, ctrl: Long): Boolean {
+        if (ctrl == 0L) return false
+        val flag = readBytes(pid, ctrl + CTRL_DUCKED, 1)?.get(0)?.toInt()
+        if (flag != null) return (flag and 1) == 1
+        // Fallback for a partially readable controller: remote setDucked also tags
+        // the ducked body-shape id. Fail closed if neither field is readable.
+        return readInt(pid, ctrl + CTRL_DUCKED_SHAPE) == DUCKED_SHAPE_VALUE
+    }
+
     private fun teamIdOf(pid: Int, obj: Long): Int =
         if (obj == 0L) -1 else (readInt(pid, obj + TEAM_ID_OFFSET) ?: -1)
 
@@ -452,7 +508,8 @@ internal object MemoryPatcher {
             val hostile = !teamCheck || isHostile(team, localTeam, KIND_PLAYER)
             val friendly = teamCheck && !hostile
             if (friendly && !showFriendliesDimmed) continue
-            val t = EspTarget(pos.first, pos.second, KIND_PLAYER, 0f, friendly, team)
+            val t = EspTarget(pos.first, pos.second, KIND_PLAYER, 0f, friendly, team,
+                crouched = isDucked(pid, ctrl), ctrl = ctrl)
             if (withVelocity) attachVelocity(pid, base, ctrl, KIND_PLAYER, true, t)
             out.add(t)
         }
@@ -614,8 +671,10 @@ internal object MemoryPatcher {
         }.maxByOrNull { it.depth }
         // The game zooms by scaling a world node; scale the ESP world transform by
         // the same factor so boxes stay on target when Camera POV is widened.
-        val ax = (design?.sx ?: 1f) * povScale
-        val ay = (design?.sy ?: 1f) * povScale
+        // The node itself is untouched by our writes, so apply the zoom once here.
+        val zoom = if (povPercent == POV_MIN) 1f else livePovScale(pid, base)
+        val ax = (design?.sx ?: 1f) * zoom
+        val ay = (design?.sy ?: 1f) * zoom
 
         val bx = (anchorX - ox) / s - ax * local.first.toFloat()
         val by = (viewH - anchorY - oy) / s - ay * local.second.toFloat()
@@ -800,15 +859,27 @@ internal object MemoryPatcher {
     private const val POV_LC_FIELD = 0x2b4L
     private const val POV_LC_SMOOTH = 0x29cL
     private const val POV_LC_LEGACY = 0x298L
-    private const val POV_MIN = 100
-    private const val POV_MAX = 160
+    const val POV_MIN = 100
+    const val POV_MAX = 500
 
     @Volatile var povPercent: Int = POV_MIN
         private set
-    @Volatile var povScale: Float = 1f          // 100% -> 1.0, 160% -> 0.625
+    @Volatile var povScale: Float = 1f          // 100% -> 1.0, 500% -> 0.2
         private set
     @Volatile private var povKeeper = false
     private var povThread: Thread? = null
+
+    /**
+     * Zoom the game is actually rendering with. All three consumers of the POV
+     * fields (getViewScaleV4, getViewScale, updateStep) are linear in this
+     * value with no runtime clamp, so ESP must use the live value rather than
+     * the requested one when the game briefly overwrites it (weapon/scope swap).
+     */
+    private fun livePovScale(pid: Int, base: Long): Float {
+        val lc = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) } ?: return povScale
+        val z = readFloat(pid, lc + POV_LC_FIELD) ?: return povScale
+        return if (finite(z.toDouble()) && z in 0.05f..1f) z else povScale
+    }
 
     private fun applyPov(): Boolean {
         val pid = findPid() ?: return false
@@ -819,9 +890,15 @@ internal object MemoryPatcher {
             return false
         }
         val z = povScale
-        return writeFloat(pid, lc + POV_LC_FIELD, z) and
+        val ok = writeFloat(pid, lc + POV_LC_FIELD, z) and
             writeFloat(pid, lc + POV_LC_SMOOTH, z) and
             writeFloat(pid, lc + POV_LC_LEGACY, z)
+        if (povPercent != POV_MIN) {
+            val actual = readFloat(pid, lc + POV_LC_FIELD)
+            logPredict("POV", "pct=$povPercent req=${"%.3f".format(z)} " +
+                "actual=${actual?.let { "%.3f".format(it) } ?: "?"} ok=$ok")
+        }
+        return ok
     }
 
     fun setPov(percent: Int): Boolean {
@@ -1081,7 +1158,9 @@ internal object MemoryPatcher {
                     val p = findPid()
                     val b = p?.let { findModuleBase(it) }
                     if (p != null && b != null) {
-                        val angle = aimAngle(p, b)
+                        val aim = aimAngle(p, b)
+                        val override = grenadeOverrideAngle
+                        val angle = if (override.isNaN()) aim else override
                         writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, angle)
                         writeLosFrame(p, b, angle)
                     }
@@ -1504,6 +1583,200 @@ internal object MemoryPatcher {
         }
     }
 
+    // ---- auto grenade ----------------------------------------------------
+    // RE summary (cocos2dcpp_disasm.txt line numbers):
+    //   HUD::onGrenade 0x667858 calls the local controller's virtual slot +0x4f8,
+    //   resolved via _ZTV22SoldierLocalController to SoldierLocalController::throwDual
+    //   0x8edf34 (disasm:1145063). throwDual posts the "GrenadeLaunched" notification
+    //   (0x108b0a0) with 9 params; ProjectileManager::grenadeLaunched 0x804980 is the
+    //   registered observer (init disasm:902521) and calls addGrenade 0x806820.
+    //   The throw ANGLE is the float returned by SoldierLocalController::getFireAngle
+    //   (vptr+0x480, disasm:1145207-1145209), i.e. the same joypad angle aimlock writes.
+    //   addGrenade converts it with -PI/180 (0x1084a18, disasm:904919-904922) and
+    //   launches at a fixed speed of 40.0 (mov w0,#0x28, disasm:1145286/1145296).
+    //   FRAGNADE fuse: [weapon+0x190] accumulates dt and detonates above 1.75 s
+    //   (disasm:416451-416459).
+    // There is NO joypad byte or other writable field that initiates a throw: the
+    // only local trigger is the HUD menu callback. Auto Grenade therefore arms the
+    // ballistic aim entirely through memory writes and leaves the button tap to the
+    // operator (least-risky alternative; no cocos API cave, no in-game call).
+
+    private const val GRENADE_THROW_SPEED = 40.0       // disasm:1145286
+    private const val GRENADE_FUSE_SECONDS = 1.75      // disasm:416451
+    private const val GRAVITY_FACTOR_GLOBAL = 0x13c20a8L // gravityFactor OBJECT, dynsyms line 1976
+    private const val GRENADE_GRAVITY_FALLBACK = 25.0  // FILL: calibrate from live gravityFactor
+    private const val GRENADE_MAX_RANGE = 1600.0
+    private const val GRENADE_COOLDOWN_MS = 1500L
+
+    private data class GrenadeArc(
+        val angleDeg: Float, val distance: Double, val speed: Double,
+        val gravity: Double, val flightSeconds: Double, val reachable: Boolean,
+    )
+
+    @Volatile var autoGrenadeEnabled = false
+        private set
+    @Volatile private var autoGrenadeInfo: String = "off"
+    @Volatile private var autoGrenadeArmed = false
+    @Volatile private var grenadeThrowRequested = false
+    @Volatile private var grenadeOverrideAngle = Float.NaN
+    private var autoGrenadeThread: Thread? = null
+    private var lastGrenadeMs = 0L
+
+    /** Live gravity factor; falls back to a documented default and says so in logs. */
+    private fun grenadeGravityOf(pid: Int, base: Long): Pair<Double, String> {
+        val f = readFloat(pid, base + GRAVITY_FACTOR_GLOBAL)?.toDouble()
+        if (f != null && finite(f) && f in 1.0..5000.0) return f to "factor-f32"
+        val i = readInt(pid, base + GRAVITY_FACTOR_GLOBAL)?.toDouble()
+        if (i != null && finite(i) && i in 1.0..5000.0) return i to "factor-i32"
+        return GRENADE_GRAVITY_FALLBACK to "fallback(FILL)"
+    }
+
+    /**
+     * Low-arc ballistic solution toward a same-height target. The game fixes launch
+     * speed and gravity, so only the angle is ours to choose:
+     *   disc = v^4 - g*(g*d^2 + 2*h*v^2)
+     *   theta = atan((v^2 - sqrt(disc)) / (g*d))
+     * Three refinement passes fold shooter velocity into the required launch vector.
+     */
+    private fun solveGrenadeArc(
+        ox: Double, oy: Double, tx: Double, ty: Double,
+        shooterVx: Double, shooterVy: Double, speed: Double, gravity: Double,
+    ): GrenadeArc {
+        val d = kotlin.math.abs(tx - ox)
+        val h = ty - oy
+        if (speed <= 0.0 || gravity <= 0.0 || d < 1.0 || d > GRENADE_MAX_RANGE) {
+            return GrenadeArc(Float.NaN, d, speed, gravity, 0.0, false)
+        }
+        val v2 = speed * speed
+        val disc = v2 * v2 - gravity * (gravity * d * d + 2.0 * h * v2)
+        if (!finite(disc) || disc < 0.0) {
+            return GrenadeArc(Float.NaN, d, speed, gravity, 0.0, false)
+        }
+        var theta = kotlin.math.atan((v2 - kotlin.math.sqrt(disc)) / (gravity * d))
+        var t = 0.0
+        repeat(3) {
+            t = d / (speed * kotlin.math.cos(theta).coerceAtLeast(0.05))
+            val needVx = d / t.coerceAtLeast(0.01) - shooterVx
+            val needVy = h / t.coerceAtLeast(0.01) + 0.5 * gravity * t - shooterVy
+            theta = kotlin.math.atan2(needVy, needVx)
+        }
+        val deg = (theta * 180.0 / Math.PI).toFloat()
+        return GrenadeArc(deg, d, speed, gravity, t, finite(deg.toDouble()))
+    }
+
+    fun toggleAutoGrenade(enable: Boolean): Boolean {
+        if (!enable) {
+            autoGrenadeEnabled = false
+            autoGrenadeThread?.interrupt()
+            try { autoGrenadeThread?.join(200) } catch (_: InterruptedException) {}
+            autoGrenadeThread = null
+            autoGrenadeArmed = false
+            grenadeThrowRequested = false
+            grenadeOverrideAngle = Float.NaN
+            autoGrenadeInfo = "off"
+            PatchLogger.log("GREN", "auto grenade disabled")
+            return true
+        }
+        if (autoGrenadeEnabled) return true
+        val pid = findPid() ?: return false
+        val base = findModuleBase(pid) ?: return false
+        autoGrenadeEnabled = true
+        lastGrenadeMs = 0L
+        PatchLogger.log("GREN", "auto grenade armed - aim driven, HUD grenade tap required")
+
+        autoGrenadeThread = Thread {
+            var p = pid
+            var b = base
+            while (autoGrenadeEnabled) {
+                // Fail closed every pass; only the armed branch may override aim.
+                grenadeOverrideAngle = Float.NaN
+                try {
+                    val cp = findPid()
+                    val cb = cp?.let { findModuleBase(it) }
+                    if (cp == null || cb == null) {
+                        autoGrenadeArmed = false
+                        Thread.sleep(200)
+                        continue
+                    }
+                    p = cp
+                    b = cb
+
+                    val (gravity, gravitySrc) = grenadeGravityOf(p, b)
+                    val lc = writableLocalController(p, b)
+                    val origin = lc?.let { soldierPosition(p, it) }
+                    val localVel = lc?.let { readLong(p, it + 0x1a8) }
+                        ?.let { body -> readVec(p, body + BODY_VEL_X) }
+                    val now = System.currentTimeMillis()
+                    var snap = "g=${"%.2f".format(gravity)}[$gravitySrc] no target"
+
+                    if (origin != null && sceneStable(p, b)) {
+                        val enemies = collectTargets(p, b, withVelocity = true)
+                            .filter { it.kind == KIND_PLAYER && !it.friendly }
+                        // The proven LOS cave probes only the aimlock's nearest target,
+                        // so the crouched enemy must be that same nearest enemy.
+                        val target = enemies.minByOrNull {
+                            hypot(it.x - origin.first, it.y - origin.second)
+                        }
+                        val duckCount = enemies.count { it.crouched }
+                        if (target != null && target.crouched) {
+                            val rawDist = hypot(target.x - origin.first, target.y - origin.second)
+                            val visible = losVisible(p, b) == true
+                            val arc = solveGrenadeArc(
+                                origin.first, origin.second, target.x, target.y,
+                                localVel?.first ?: 0.0, localVel?.second ?: 0.0,
+                                GRENADE_THROW_SPEED, gravity,
+                            )
+                            val inRange = rawDist <= GRENADE_MAX_RANGE && arc.reachable && visible
+                            if (inRange) {
+                                // Pure memory writes only: the aimlock writer publishes
+                                // this angle every frame, so overriding there avoids a
+                                // write race on the FIRE_ANGLE_OFFSET+20 slot.
+                                grenadeOverrideAngle = arc.angleDeg
+                                autoGrenadeArmed = true
+                                if (now - lastGrenadeMs >= GRENADE_COOLDOWN_MS) {
+                                    grenadeThrowRequested = true
+                                    lastGrenadeMs = now
+                                }
+                            } else {
+                                autoGrenadeArmed = false
+                            }
+                            snap = "crouch=true d=${"%.0f".format(rawDist)} " +
+                                "los=${if (visible) "yes" else "no"} " +
+                                "ang=${"%.1f".format(arc.angleDeg)} " +
+                                "t=${"%.2f".format(arc.flightSeconds)} " +
+                                "v=${"%.0f".format(arc.speed)} g=${"%.2f".format(gravity)}[$gravitySrc] " +
+                                "armed=$autoGrenadeArmed range=${if (inRange) "pass" else "fail"}"
+                        } else {
+                            autoGrenadeArmed = false
+                            snap = "g=${"%.2f".format(gravity)}[$gravitySrc] no crouched nearest " +
+                                "(enemies=${enemies.size} crouched=$duckCount)"
+                        }
+                    } else {
+                        autoGrenadeArmed = false
+                        snap = "g=${"%.2f".format(gravity)}[$gravitySrc] paused - scene/controller"
+                    }
+                    autoGrenadeInfo = snap
+                    logPredict("GREN", snap)
+                } catch (t: Throwable) {
+                    autoGrenadeArmed = false
+                    autoGrenadeInfo = "loop: ${t.message}"
+                    PatchLogger.log("GREN", "loop: ${t.message}")
+                }
+                Thread.sleep(32)
+            }
+            autoGrenadeArmed = false
+            grenadeOverrideAngle = Float.NaN
+        }.apply { isDaemon = true; start() }
+        return true
+    }
+
+    /** Set by the arming loop; the UI can consume it to drive the HUD grenade tap. */
+    fun consumeGrenadeThrowRequest(): Boolean {
+        val v = grenadeThrowRequested
+        grenadeThrowRequested = false
+        return v
+    }
+
     /** Everything needed to diagnose external-ESP alignment, logged every ~2 s. */
     fun espAlignmentDebug(pid: Int, base: Long, viewW: Int, viewH: Int): String {
         fun hx(v: Long?) = v?.let { "0x${it.toString(16)}" } ?: "null"
@@ -1653,8 +1926,11 @@ internal object MemoryPatcher {
             "start=${losOrigin.first.toInt()},${losOrigin.second.toInt()} " +
             "end=${losTarget.first.toInt()},${losTarget.second.toInt()}")
         val povLc = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
-        sb.appendLine("POV: pct=$povPercent k=${"%.4f".format(povScale)} lc=${hx(povLc)} " +
-            "zoom=${if (povLc != null) readFloat(pid, povLc + POV_LC_FIELD) else null}")
+        fun f4(v: Float?) = v?.let { "%.4f".format(it) } ?: "?"
+        sb.appendLine("POV: pct=$povPercent req=${f4(povScale)} lc=${hx(povLc)} " +
+            "field=${if (povLc != null) f4(readFloat(pid, povLc + POV_LC_FIELD)) else "?"} " +
+            "smooth=${if (povLc != null) f4(readFloat(pid, povLc + POV_LC_SMOOTH)) else "?"} " +
+            "legacy=${if (povLc != null) f4(readFloat(pid, povLc + POV_LC_LEGACY)) else "?"}")
         fun f1(v: Double) = "%.1f".format(v)
         val a = aimPredict
         sb.appendLine("PREDICT AIM: w=${a.weapon} speed=${f1(a.speed)} range=${f1(a.range)} " +
@@ -1666,7 +1942,372 @@ internal object MemoryPatcher {
             "tgt=${g.targetKind} d=${f1(g.rawDist)} v=${f1(g.vx)},${f1(g.vy)}[${g.velSrc}] " +
             "a=${f1(g.ax)},${f1(g.ay)} tt=${"%.3f".format(g.travel)} lead=${f1(g.predictedDist)} " +
             "limit=${f1(g.gateLimit)} gate=${g.gatePass}")
+        val (grenGravity, grenSrc) = grenadeGravityOf(pid, base)
+        sb.appendLine("GRENADE: enabled=$autoGrenadeEnabled armed=$autoGrenadeArmed " +
+            "speed=${f1(GRENADE_THROW_SPEED)} fuse=${f1(GRENADE_FUSE_SECONDS)} " +
+            "g=${"%.2f".format(grenGravity)}[$grenSrc] $autoGrenadeInfo")
+        players.take(8).forEach { ctrl ->
+            val flag = readBytes(pid, ctrl + CTRL_DUCKED, 1)?.get(0)?.toInt()
+            val shape = readInt(pid, ctrl + CTRL_DUCKED_SHAPE)
+            sb.appendLine("  ${hx(ctrl)} duckedByte=${flag?.and(1)} shape+0x214=$shape " +
+                "crouched=${isDucked(pid, ctrl)}")
+        }
+        sb.appendLine("JOIN CAPTURE: ${joinCaptureStatus()}")
         sb.append(weaponInfo(pid, base))
+        return sb.toString()
+    }
+
+    // ---- multiplayer join capture -----------------------------------------
+    // A read-only, bounded sampler. It never writes game memory and never calls
+    // game code; every value comes from the existing /proc/<pid>/mem reader.
+
+    private val JOIN_GROUPS = listOf(
+        "PID", "BASE", "SCENE", "WIN", "LC", "TEAM", "POS", "PLAYERS", "DRONES",
+        "WEAPON", "NM", "STATE", "SESSION", "PEERS", "NETG",
+    )
+    private val joinBuffer = ArrayDeque<String>()
+    private var joinPrev = LinkedHashMap<String, String>()
+    @Volatile private var joinRunning = false
+    private var joinThread: Thread? = null
+    private var joinStartMs = 0L
+    private var joinStartedAt = "-"
+    private var joinPid = -1
+    private var joinBase = 0L
+    private var joinLastHeartbeat = 0L
+    @Volatile private var joinTotalSnapshots = 0L
+    @Volatile private var joinEmitted = 0L
+    @Volatile private var joinDropped = 0
+    @Volatile private var joinErrors = 0
+    @Volatile private var joinLogcatBaseline = ""
+
+    private val joinLogcatPattern = Regex(
+        "join|room|connect|multiplayer|\\bmm\\b|network|host|lobby|session|peer|raknet",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private fun jhex(v: Long?): String = v?.let { "0x${it.toString(16)}" } ?: "null"
+
+    private fun joinElapsed(ms: Long): String {
+        val total = (ms / 1000).coerceAtLeast(0)
+        return "%02d:%02d:%02d.%03d".format(total / 3600, (total % 3600) / 60, total % 60, ms % 1000)
+    }
+
+    /** One event, timestamped from capture start, into both the ring buffer and PatchLogger. */
+    private fun joinEmit(message: String) {
+        val elapsed = if (joinStartMs > 0L) System.currentTimeMillis() - joinStartMs else 0L
+        val line = "[t+%05dms] %s".format(elapsed, message)
+        synchronized(joinBuffer) {
+            joinBuffer.addLast(line)
+            while (joinBuffer.size > JOIN_MAX_LINES) {
+                joinBuffer.removeFirst()
+                joinDropped++
+            }
+        }
+        PatchLogger.log("JOIN", line)
+    }
+
+    /** libc++ std::string: low bit of byte 0 selects short (inline) vs long (pointer+size). */
+    private fun readStdString(pid: Int, addr: Long, maxChars: Int = 24): String {
+        if (addr == 0L) return "-"
+        val h = readBytes(pid, addr, 24) ?: return "?"
+        val raw: ByteArray
+        val len: Int
+        if (h[0].toInt() and 0x1 == 1) {
+            var p = 0L
+            var n = 0L
+            for (i in 0..7) p = p or ((h[i].toLong() and 0xff) shl (8 * i))
+            for (i in 8..15) n = n or ((h[i].toLong() and 0xff) shl (8 * i))
+            if (p == 0L || n <= 0 || n > 4096L) return "str@${jhex(p)}"
+            len = minOf(n.toInt(), maxChars)
+            raw = readBytes(pid, p, len) ?: return "str@${jhex(p)}"
+        } else {
+            len = minOf((h[0].toInt() and 0xff) ushr 1, maxChars)
+            if (len <= 0) return ""
+            raw = h.copyOfRange(1, 1 + len)
+        }
+        val sb = StringBuilder()
+        for (b in raw) {
+            val c = b.toInt() and 0xff
+            sb.append(if (c in 0x20..0x7e) c.toChar() else '.')
+        }
+        return sb.toString()
+    }
+
+    /** The getters at 0x13bf448 etc. hold a pointer to the scalar, not the scalar. */
+    private fun netScalar(pid: Int, base: Long, global: Long): Pair<String, Int> {
+        val raw = readLong(pid, base + global) ?: 0L
+        val deref = if (raw != 0L) readInt(pid, raw) else null
+        val value = deref ?: if (raw in 0L..255L) raw.toInt() else -1
+        return "${jhex(raw)}->$value" to value
+    }
+
+    /** cocos2d CCDictionary::count() disasm 0xc293e8-0xc2940c. */
+    private fun dictCountAt(pid: Int, dict: Long): Int {
+        if (dict == 0L) return 0
+        val first = readLong(pid, dict + 0x18) ?: return 0
+        if (first == 0L) return 0
+        val owner = readLong(pid, first + 0x110) ?: return 0
+        return readInt(pid, owner + 0x10) ?: 0
+    }
+
+    /** One complete read-only sample; each map entry is one change-mask group. */
+    private fun sampleJoin(pid: Int, base: Long): LinkedHashMap<String, String> {
+        val f = LinkedHashMap<String, String>()
+        f["PID"] = pid.toString()
+        f["BASE"] = jhex(base)
+
+        val director = readLong(pid, base + DIRECTOR_GLOBAL)
+        val scene = director?.let { readLong(pid, it + 0xa0) } ?: 0L
+        f["SCENE"] = jhex(scene)
+        val vw = director?.let { readFloat(pid, it + 0xd0) }
+        val vh = director?.let { readFloat(pid, it + 0xd4) }
+        f["WIN"] = if (vw != null && vh != null) "${vw.toInt()}x${vh.toInt()}" else "-"
+
+        val lcHolder = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)
+        val lc = lcHolder?.let { readLong(pid, it) } ?: 0L
+        val lcVptr = if (lc != 0L) readLong(pid, lc) else null
+        f["LC"] = "${jhex(lc)} v=${jhex(lcVptr)} vb=${jhex(lcVptr?.minus(base))}"
+        val team = if (lc != 0L) readInt(pid, lc + TEAM_ID_OFFSET) ?: -1 else -1
+        f["TEAM"] = team.toString()
+        val body = if (lc != 0L) readLong(pid, lc + 0x1a8) else null
+        val pos = body?.let { bodyPosition(pid, it) }
+        f["POS"] = pos?.let { "${it.first.toInt()},${it.second.toInt()}" } ?: "-"
+
+        val rpDict = readLong(pid, base + REMOTE_PLAYERS_GLOBAL)
+            ?.let { readLong(pid, it) } ?: 0L
+        val players = dictionaryObjects(pid, base, REMOTE_PLAYERS_GLOBAL)
+        val parts = players.take(12).map { ctrl ->
+            val blk = readBytes(pid, ctrl + TEAM_ID_OFFSET, 0x6c)
+            val bb = blk?.let { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN) }
+            val pt = bb?.getInt(0) ?: -1
+            val pb = bb?.getLong(0x64) ?: 0L
+            val pp = bodyPosition(pid, pb)
+            "${jhex(ctrl)}:t$pt:${pp?.first?.toInt() ?: 0},${pp?.second?.toInt() ?: 0}"
+        }
+        f["PLAYERS"] = "${jhex(rpDict)}/${players.size}[${parts.joinToString(";")}]"
+        f["DRONES"] = dictionaryObjects(pid, base, ALL_DRONES_GLOBAL).size.toString()
+        f["WEAPON"] = if (lc != 0L) weaponNameOf(pid, activeWeapon(pid, lc)) else "-"
+
+        // Prefer the exported singleton slot; fall back to the accessor's indirect
+        // slot. Both pointers are logged so a different build can be re-derived.
+        var nm = readLong(pid, base + NM_INSTANCE_GLOBAL) ?: 0L
+        var nmPath = "inst"
+        var nmVptr = if (nm != 0L) readLong(pid, nm) else null
+        if (nm == 0L || nmVptr == null) {
+            val slot = readLong(pid, base + NM_ACCESSOR_SLOT_GLOBAL) ?: 0L
+            val alt = if (slot != 0L) readLong(pid, slot) ?: 0L else 0L
+            if (alt != 0L) {
+                nm = alt
+                nmPath = "acc"
+                nmVptr = readLong(pid, nm)
+            }
+        }
+        f["NM"] = "${jhex(nm)}[$nmPath] v=${jhex(nmVptr)} vb=${jhex(nmVptr?.minus(base))} " +
+            "expectVb=${jhex(NM_VTABLE)}"
+        if (nm != 0L) {
+            val con = readBytes(pid, nm + NM_CONNECTED, 1)?.get(0)?.toInt() ?: -1
+            val inv = readBytes(pid, nm + NM_WAS_INVITED, 1)?.get(0)?.toInt() ?: -1
+            val ing = readBytes(pid, nm + NM_IN_GAME, 1)?.get(0)?.toInt() ?: -1
+            val max = readInt(pid, nm + NM_MAX_PLAYERS) ?: -1
+            f["STATE"] = "con=$con inv=$inv ing=$ing max=$max"
+            val session = readLong(pid, nm + NM_SESSION) ?: 0L
+            val raknet = readLong(pid, nm + NM_RAKNET) ?: 0L
+            f["SESSION"] = "ses=${jhex(session)} rk=${jhex(raknet)} " +
+                "toJoin=${readStdString(pid, nm + NM_SESSION_TO_JOIN)} " +
+                "local=${readStdString(pid, nm + NM_LOCAL_PEER_ID)} " +
+                "leader=${readStdString(pid, nm + NM_LEADER_PEER_ID)}"
+            val peerDict = readLong(pid, nm + NM_PEER_DICT) ?: 0L
+            f["PEERS"] = "${jhex(peerDict)}/${dictCountAt(pid, peerDict)}"
+        } else {
+            for (g in listOf("STATE", "SESSION", "PEERS")) f[g] = "-"
+        }
+        val ct = netScalar(pid, base, NET_CONN_TYPE_GLOBAL)
+        val rs = netScalar(pid, base, NET_REQ_SESSION_GLOBAL)
+        val sd = netScalar(pid, base, NET_SESSION_DONE_GLOBAL)
+        val qp = netScalar(pid, base, NET_QUICKPLAY_POP_GLOBAL)
+        val sa = netScalar(pid, base, NET_SHOW_ASK_GLOBAL)
+        f["NETG"] = "ct=${ct.first} req=${rs.first} done=${sd.first} pop=${qp.first} ask=${sa.first}"
+        return f
+    }
+
+    private fun stopJoinCaptureInternal(reason: String) {
+        joinRunning = false
+        joinEmit("STOP reason=$reason snapshots=$joinTotalSnapshots")
+        PatchLogger.log("JOIN", "capture stopped: $reason snapshots=$joinTotalSnapshots")
+        joinThread?.interrupt()
+    }
+
+    private fun startJoinCaptureThread() {
+        joinThread = Thread {
+            var tick = 0
+            while (joinRunning) {
+                val t0 = System.currentTimeMillis()
+                try {
+                    // Re-validate the process every 4th tick (200 ms). A relaunch
+                    // mid-join ends the capture instead of tracing a different PID.
+                    if (tick++ % 4 == 0) {
+                        val nowPid = findPid()
+                        if (nowPid == null || nowPid != joinPid) {
+                            joinEmit("PIDCHG now=$nowPid expected=$joinPid")
+                            stopJoinCaptureInternal("pid change")
+                            break
+                        }
+                        val nowBase = findModuleBase(nowPid)
+                        if (nowBase == null || nowBase != joinBase) {
+                            joinEmit("BASECHG now=${jhex(nowBase)} expected=${jhex(joinBase)}")
+                            stopJoinCaptureInternal("module base change")
+                            break
+                        }
+                    }
+                    val fields = sampleJoin(joinPid, joinBase)
+                    joinTotalSnapshots++
+                    val changed = JOIN_GROUPS.filter { fields[it] != joinPrev[it] }
+                    if (changed.isNotEmpty()) {
+                        val detail = changed.joinToString(" ") { "$it=${fields[it]}" }
+                        joinEmit("CHG ${changed.joinToString(",")} | $detail")
+                        joinEmitted++
+                        joinPrev = fields
+                    }
+                    val elapsed = t0 - joinStartMs
+                    if (elapsed - joinLastHeartbeat >= JOIN_HEARTBEAT_MS) {
+                        joinLastHeartbeat = elapsed
+                        val core = listOf("SCENE", "LC", "PLAYERS", "DRONES", "WEAPON", "NM", "STATE", "PEERS")
+                            .joinToString(" ") { "$it=${fields[it]}" }
+                        joinEmit("HB | $core")
+                        joinEmitted++
+                    }
+                } catch (t: Throwable) {
+                    joinErrors++
+                    if (joinErrors <= 5) joinEmit("ERR ${t.javaClass.simpleName}: ${t.message}")
+                }
+                val spent = System.currentTimeMillis() - t0
+                if (spent < JOIN_SAMPLE_MS) {
+                    try {
+                        Thread.sleep(JOIN_SAMPLE_MS - spent)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }
+        }.apply {
+            isDaemon = true
+            name = "mp-join-capture"
+            start()
+        }
+    }
+
+    private fun joinRunLogcat(limit: Int): List<String> {
+        // Fixed argument arrays: no untrusted string is ever built into a shell command.
+        val commands = listOf(
+            arrayOf("logcat", "-d", "-t", limit.toString()),
+            arrayOf("su", "-c", "logcat -d -t $limit"),
+        )
+        for (command in commands) {
+            try {
+                val process = Runtime.getRuntime().exec(command)
+                val output = process.inputStream.bufferedReader().use { it.readText() }
+                if (output.isNotBlank()) return output.lines()
+            } catch (_: Exception) {
+                // Try the next command.
+            }
+        }
+        return emptyList()
+    }
+
+    private fun joinSanitize(line: String): String {
+        val trimmed = line.trim().take(240)
+        val sb = StringBuilder(trimmed.length)
+        for (c in trimmed) sb.append(if (c.isISOControl() && c != '\t') ' ' else c)
+        return sb.toString()
+    }
+
+    private fun joinMatchingLogcat(): List<String> {
+        val lines = joinRunLogcat(1200)
+        if (lines.isEmpty()) return emptyList()
+        val startIdx = if (joinLogcatBaseline.isBlank()) {
+            maxOf(0, lines.size - 400)
+        } else {
+            val idx = lines.indexOfFirst { joinSanitize(it) == joinLogcatBaseline }
+            if (idx >= 0) idx + 1 else maxOf(0, lines.size - 400)
+        }
+        val out = LinkedHashSet<String>()
+        for (line in lines.drop(startIdx)) {
+            val s = joinSanitize(line)
+            if (s.isNotBlank() && joinLogcatPattern.containsMatchIn(s)) out.add(s)
+            if (out.size >= JOIN_MAX_LOGCAT) break
+        }
+        return out.toList()
+    }
+
+    /** Tap-on starts the sampler; returns false when the game is not running. */
+    fun startJoinCapture(): Boolean {
+        if (joinRunning) return false
+        val attached = attach() ?: return false
+        synchronized(joinBuffer) { joinBuffer.clear() }
+        joinPrev.clear()
+        joinPid = attached.first
+        joinBase = attached.second
+        joinStartMs = System.currentTimeMillis()
+        joinStartedAt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date(joinStartMs))
+        joinTotalSnapshots = 0L
+        joinEmitted = 0L
+        joinDropped = 0
+        joinErrors = 0
+        joinLastHeartbeat = 0L
+        joinLogcatBaseline = joinRunLogcat(40).lastOrNull { it.isNotBlank() }
+            ?.let { joinSanitize(it) } ?: ""
+        joinRunning = true
+        joinEmit("START pid=$joinPid base=${jhex(joinBase)} sample=${JOIN_SAMPLE_MS}ms")
+        PatchLogger.log("JOIN", "capture started pid=$joinPid base=${jhex(joinBase)}")
+        startJoinCaptureThread()
+        return true
+    }
+
+    /** Tap-off stops the sampler and returns the final dump. */
+    fun stopJoinCapture(): String {
+        if (joinRunning) stopJoinCaptureInternal("toggle off")
+        joinThread?.let { thread ->
+            try {
+                thread.join(400)
+            } catch (_: InterruptedException) {
+            }
+        }
+        joinThread = null
+        return joinCaptureDump()
+    }
+
+    /** Teardown path: stop without building a dump (no logcat work on the UI thread). */
+    fun abortJoinCapture() {
+        if (joinRunning) stopJoinCaptureInternal("app teardown")
+        joinThread = null
+    }
+
+    fun joinCaptureRunning(): Boolean = joinRunning
+
+    fun joinCaptureStatus(): String {
+        val elapsed = if (joinStartMs > 0L) System.currentTimeMillis() - joinStartMs else 0L
+        val buffered = synchronized(joinBuffer) { joinBuffer.size }
+        return "running=${if (joinRunning) "ON" else "OFF"} elapsed=${joinElapsed(elapsed)} " +
+            "snapshots=$joinTotalSnapshots emitted=$joinEmitted buf=$buffered/$JOIN_MAX_LINES"
+    }
+
+    /** Full bounded trace, appended verbatim to COPY LOGS via PatchLogger.appendBlock. */
+    fun joinCaptureDump(): String {
+        val sb = StringBuilder()
+        sb.appendLine("=== MULTIPLAYER JOIN CAPTURE ===")
+        sb.appendLine(joinCaptureStatus())
+        sb.appendLine("started: $joinStartedAt")
+        sb.appendLine("pid/base: $joinPid / ${jhex(joinBase)}")
+        sb.appendLine("errors=$joinErrors dropped=$joinDropped sample=${JOIN_SAMPLE_MS}ms")
+        val snapshot = synchronized(joinBuffer) { joinBuffer.toList() }
+        sb.appendLine("--- trace (${snapshot.size}/$JOIN_MAX_LINES lines) ---")
+        if (snapshot.isEmpty()) sb.appendLine("(no snapshots)")
+        else snapshot.forEach { sb.appendLine(it) }
+        sb.appendLine("--- matching logcat (max $JOIN_MAX_LOGCAT, deduped) ---")
+        val logs = joinMatchingLogcat()
+        if (logs.isEmpty()) sb.appendLine("(none - logcat may be restricted on this ROM)")
+        else logs.forEach { sb.appendLine(it) }
+        sb.appendLine("=== END JOIN CAPTURE ===")
         return sb.toString()
     }
 }

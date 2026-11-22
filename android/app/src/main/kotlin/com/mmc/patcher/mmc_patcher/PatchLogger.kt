@@ -14,7 +14,10 @@ import java.util.Locale
 /** Small in-memory log plus logcat tail, copied to the clipboard for crash reports. */
 internal object PatchLogger {
     private const val MAX_EVENTS = 200
+    private const val MAX_BLOCKS = 4
     private val events = mutableListOf<String>()
+    /** Verbatim multi-line blocks (e.g. a capture dump) that must not be collapsed. */
+    private val blocks = mutableListOf<Pair<String, String>>()
     private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
     private var installed = false
 
@@ -32,6 +35,15 @@ internal object PatchLogger {
             while (events.size > MAX_EVENTS) events.removeAt(0)
         }
         android.util.Log.d("MMCPatcher", line)
+    }
+
+    /** Store a full dump verbatim so it lands in [collect] without repeat collapsing. */
+    fun appendBlock(title: String, body: String) {
+        synchronized(events) {
+            blocks.removeAll { it.first == title }
+            blocks.add(title to body)
+            while (blocks.size > MAX_BLOCKS) blocks.removeAt(0)
+        }
     }
 
     fun installCrashHandler(context: Context) {
@@ -77,7 +89,14 @@ internal object PatchLogger {
         sb.appendLine("app: ${context.packageName}")
         sb.appendLine()
         sb.appendLine("--- app events ---")
-        synchronized(events) { collapse(events.toList()).forEach { sb.appendLine(it) } }
+        synchronized(events) {
+            collapse(events.toList()).forEach { sb.appendLine(it) }
+            for ((title, body) in blocks) {
+                sb.appendLine()
+                sb.appendLine("--- $title ---")
+                sb.appendLine(body)
+            }
+        }
         sb.appendLine()
         val logcat = readLogcat().lines().filter {
             !it.contains("avc: denied") && !it.contains("type=1400 audit")

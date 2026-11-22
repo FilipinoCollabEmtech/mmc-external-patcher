@@ -25,6 +25,7 @@ import android.widget.TextView
 import android.widget.Toast
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.applyGroup
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleAimlock
+import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleAutoGrenade
 import com.mmc.patcher.mmc_patcher.MemoryPatcher.toggleTriggerbot
 
 /**
@@ -43,11 +44,14 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var esp: EspOverlay? = null
 
     /** Remembered so reopening the panel shows the real state instead of resetting switches. */
-    private val states = LinkedHashMap<String, Boolean>().apply { put("teamCheck", MemoryPatcher.teamCheck) }
+    private val states = LinkedHashMap<String, Boolean>().apply {
+        put("teamCheck", MemoryPatcher.teamCheck)
+        put("joinCapture", false)
+    }
 
     /** Slider values persist across panel rebuilds the same way toggles do. */
     private val sliderValues = LinkedHashMap<String, Float>().apply {
-        put("pov", MemoryPatcher.povPercent.toFloat())
+        put("pov", MemoryPatcher.povPercent.toFloat().coerceIn(MemoryPatcher.POV_MIN.toFloat(), MemoryPatcher.POV_MAX.toFloat()))
     }
 
     private val accent = Color.rgb(255, 92, 92)
@@ -117,6 +121,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
 
     fun hide() {
         runCatching { activity.application.unregisterComponentCallbacks(configCallback) }
+        runCatching { MemoryPatcher.abortJoinCapture() }
         icon?.let { runCatching { wm.removeView(it) } }
         panel?.let { runCatching { wm.removeView(it) } }
         icon = null
@@ -361,6 +366,36 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 ok
             }
         })
+        container.addView(toggleRow("autoGrenade", "✹", "Auto Grenade",
+            "Ballistic aim on crouched enemies · tap HUD grenade to throw") { checked ->
+            if (!ensureAttached()) {
+                toast("Launch MMC first")
+                false
+            } else if (!checked) {
+                toggleAutoGrenade(false)
+                true
+            } else {
+                if (states["aim"] != true) {
+                    if (!toggleAimlock(true)) { toast("Could not enable Aimlock"); return@toggleRow false }
+                    states["aim"] = true
+                }
+                if (states["los"] != true) {
+                    if (!MemoryPatcher.installLos(pid!!, base!!)) {
+                        toast("Could not enable Wall Check")
+                        return@toggleRow false
+                    }
+                    states["los"] = true
+                }
+                val ok = toggleAutoGrenade(true)
+                if (ok) {
+                    toast("Auto Grenade armed - HUD grenade tap throws")
+                    Handler(Looper.getMainLooper()).post { refreshPanel() }
+                } else {
+                    toast("Auto Grenade failed - check logs")
+                }
+                ok
+            }
+        })
         container.addView(toggleRow("espBoxes", "▣", "ESP Boxes", "Outline targets through walls") { checked ->
             setEsp(boxes = checked)
             true
@@ -371,7 +406,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
         })
 
         container.addView(sectionTitle("VIEW  /  CAMERA"))
-        container.addView(sliderRow("pov", "⤢", "Camera POV", "Wider view - ESP follows", 100, 160, 5, "%") { pct ->
+        container.addView(sliderRow("pov", "⤢", "Camera POV", "Up to 5x wider - ESP follows", MemoryPatcher.POV_MIN, MemoryPatcher.POV_MAX, 5, "%") { pct ->
             val ok = MemoryPatcher.setPov(pct)
             if (!ok) toast("Saved - applies when MMC is running")
             true // keep the value even before the game launches
@@ -397,6 +432,22 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 espDebug = null
             }
             true
+        })
+        container.addView(toggleRow("joinCapture", "⏺", "Capture MP Join", "Tap on, join a match, tap off · COPY LOGS") { checked ->
+            if (checked) {
+                if (!MemoryPatcher.startJoinCapture()) {
+                    toast("Launch MMC first")
+                    false
+                } else {
+                    toast("Recording join flow - tap again to stop")
+                    true
+                }
+            } else {
+                val dumped = MemoryPatcher.stopJoinCapture()
+                PatchLogger.log("JOIN", "export ready: ${dumped.length} chars")
+                toast("Captured - tap COPY LOGS to export")
+                true
+            }
         })
 
         container.addView(TextView(activity).apply {
@@ -720,6 +771,9 @@ internal class FloatingMenu(private val activity: MainActivity) {
         PatchLogger.log("UI", "copy logs tapped")
         MemoryPatcher.attach()?.let { (p, b) ->
             runCatching { PatchLogger.log("ESPDBG", MemoryPatcher.espDebugInfo(p, b)) }
+        }
+        runCatching {
+            PatchLogger.appendBlock("MULTIPLAYER JOIN CAPTURE", MemoryPatcher.joinCaptureDump())
         }
         if (PatchLogger.copyToClipboard(activity)) {
             toast("Logs copied")
