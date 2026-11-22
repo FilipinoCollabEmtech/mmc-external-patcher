@@ -6,6 +6,7 @@ import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.atan2
 import kotlin.math.hypot
 
@@ -22,6 +23,8 @@ internal const val KIND_LOCAL = 6
 internal data class EspTarget(
     val x: Double, val y: Double, val kind: Int, val hp: Float,
     val friendly: Boolean = false, val teamId: Int = -1,
+    var vx: Double = 0.0, var vy: Double = 0.0, var velSrc: String = "-",
+    var ax: Double = 0.0, var ay: Double = 0.0,
 )
 internal data class Camera(
     val x: Float, val y: Float,           // B: world offset in cocos points
@@ -384,7 +387,7 @@ internal object MemoryPatcher {
         return soldierPosition(pid, lc)
     }
 
-    fun collectTargets(pid: Int, base: Long): List<EspTarget> {
+    fun collectTargets(pid: Int, base: Long, withVelocity: Boolean = false): List<EspTarget> {
         val out = mutableListOf<EspTarget>()
         val seen = HashSet<Long>()
         val localTeam = if (teamCheck) localTeamId(pid, base) else -1
@@ -398,7 +401,9 @@ internal object MemoryPatcher {
                 0x135a960L + 0x10 -> KIND_WORM
                 else -> KIND_DRONE
             }
-            out.add(EspTarget(pos.first, pos.second, kind, 0f))
+            val t = EspTarget(pos.first, pos.second, kind, 0f)
+            if (withVelocity) attachVelocity(pid, base, obj, kind, false, t)
+            out.add(t)
         }
 
         // Multiplayer / LAN players: *(*(base+0x13bf260))
@@ -413,9 +418,106 @@ internal object MemoryPatcher {
             val hostile = !teamCheck || isHostile(team, localTeam, KIND_PLAYER)
             val friendly = teamCheck && !hostile
             if (friendly && !showFriendliesDimmed) continue
-            out.add(EspTarget(pos.first, pos.second, KIND_PLAYER, 0f, friendly, team))
+            val t = EspTarget(pos.first, pos.second, KIND_PLAYER, 0f, friendly, team)
+            if (withVelocity) attachVelocity(pid, base, ctrl, KIND_PLAYER, true, t)
+            out.add(t)
         }
         return out
+    }
+
+    // ---- target velocity: game field first, finite difference as fallback ----
+
+    private class VelMem(
+        val x: Double, val y: Double, val t: Long,
+        var evx: Double, var evy: Double,
+        var ax: Double = 0.0, var ay: Double = 0.0,
+        var rvx: Double = 0.0, var rvy: Double = 0.0,
+    )
+    private val velHistory = ConcurrentHashMap<Long, VelMem>()
+
+    private fun finite(v: Double) = !v.isNaN() && !v.isInfinite()
+
+    private fun readVec(pid: Int, address: Long): Pair<Double, Double>? {
+        val buf = readBytes(pid, address, 16) ?: return null
+        val b = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+        val x = b.getDouble(0)
+        val y = b.getDouble(8)
+        if (!finite(x) || !finite(y) || hypot(x, y) > MAX_TARGET_SPEED) return null
+        return x to y
+    }
+
+    /** Reads the velocity the game itself stores; null when the field is missing/garbage. */
+    private fun directVelocity(
+        pid: Int, base: Long, key: Long, kind: Int, isPlayer: Boolean,
+    ): Pair<Double, Double>? {
+        if (isPlayer) return readVec(pid, key + REMOTE_VEL_X)
+        val vptr = readLong(pid, key) ?: return null
+        val body = when (vptr - base) {
+            0x1334620L, 0x132d1d0L -> {
+                val ctrl = readLong(pid, key + 0x200) ?: return null
+                readLong(pid, ctrl + 0x1a8) ?: return null
+            }
+            0x1333800L -> readLong(pid, key + 0x230) ?: return null  // hawk
+            0x135a970L -> readLong(pid, key + 0x228) ?: return null  // worm
+            else -> return null
+        }
+        readVec(pid, body + BODY_VEL_X)?.let { return it }
+        return readVec(pid, key + FALLBACK_VEL_X)
+    }
+
+    /** EMA-smoothed velocity; direct memory field wins unless it is stale/zero while moving. */
+    private fun attachVelocity(
+        pid: Int, base: Long, key: Long, kind: Int, isPlayer: Boolean, t: EspTarget,
+    ) {
+        val now = System.currentTimeMillis()
+        val prev = velHistory[key]
+        val direct = directVelocity(pid, base, key, kind, isPlayer)
+
+        var diff: Pair<Double, Double>? = null
+        if (prev != null) {
+            val dt = now - prev.t
+            if (dt in VEL_MIN_DT_MS..VEL_MAX_DT_MS) {
+                val dx = (t.x - prev.x) * 1000.0 / dt
+                val dy = (t.y - prev.y) * 1000.0 / dt
+                if (finite(dx) && finite(dy) && hypot(dx, dy) <= MAX_TARGET_SPEED) diff = dx to dy
+            }
+        }
+
+        val directSpeed = direct?.let { hypot(it.first, it.second) } ?: -1.0
+        val diffSpeed = diff?.let { hypot(it.first, it.second) } ?: -1.0
+        // A zero replicated field with a visibly moving target means the field is stale.
+        val useDirect = direct != null && (directSpeed > 1.0 || diffSpeed < 0.0 || diffSpeed < 2.0)
+        val raw = when {
+            useDirect -> direct
+            diff != null -> diff
+            else -> prev?.let { it.evx to it.evy } ?: (0.0 to 0.0)
+        }
+        val evx = if (prev != null) prev.evx + VEL_EMA * (raw.first - prev.evx) else raw.first
+        val evy = if (prev != null) prev.evy + VEL_EMA * (raw.second - prev.evy) else raw.second
+        // Acceleration from the change in resolved velocity; clamp so a velocity-source
+        // switch (mem -> diff) cannot inject a spike into the lead prediction.
+        val dt = (now - (prev?.t ?: now)).toDouble() / 1000.0
+        val ax: Double
+        val ay: Double
+        if (prev != null && dt in 0.008..0.25) {
+            val dax = ((raw.first - prev.rvx) / dt).coerceIn(-MAX_ACCEL, MAX_ACCEL)
+            val day = ((raw.second - prev.rvy) / dt).coerceIn(-MAX_ACCEL, MAX_ACCEL)
+            ax = ACCEL_EMA * dax + (1.0 - ACCEL_EMA) * prev.ax
+            ay = ACCEL_EMA * day + (1.0 - ACCEL_EMA) * prev.ay
+        } else {
+            ax = prev?.ax ?: 0.0
+            ay = prev?.ay ?: 0.0
+        }
+        velHistory[key] = VelMem(t.x, t.y, now, evx, evy, ax, ay, raw.first, raw.second)
+        if (velHistory.size > 128) {
+            val it = velHistory.entries.iterator()
+            while (it.hasNext()) if (now - it.next().value.t > 2000L) it.remove()
+        }
+        t.vx = evx
+        t.vy = evy
+        t.ax = ax
+        t.ay = ay
+        t.velSrc = if (useDirect) "mem" else if (diff != null) "diff" else "hold"
     }
 
     // ---- ESP camera ----
@@ -539,6 +641,41 @@ internal object MemoryPatcher {
     private const val W_RELOAD_MOD = 0x27cL
     private const val W_IS_RELOADING = 0x285L
     private const val W_IS_DUAL = 0x288L
+
+    // ---- velocity / lead fields (cocos2dcpp_disasm.txt line numbers in comments) ----
+    // chipmunk cpBody: pos at +0x30/+0x38, vel at +0x40/+0x48 (both double pairs).
+    // SoldierController::getBodyPosition 0x8e2d20 loads [body+0x30] (disasm:1133503);
+    // SoldierController::getBodyVelocity 0x8e2d84 loads [body+0x40] (disasm:1133530).
+    // Same +0x40 velocity read in SoldierAIController (disasm:1131355),
+    // HumanoidDrone (disasm:497088-497091), HawkDrone (disasm:490899-490902),
+    // WormDrone (disasm:1261979-1261982).
+    private const val BODY_VEL_X = 0x40L
+    private const val BODY_VEL_Y = 0x48L
+    // SoldierRemoteController::getBodyVelocity 0x8f6380 loads [this+0x260] (disasm:1153673);
+    // setRemoteVelocity 0x8f62e4 stores [this+0x260]/[this+0x268] (disasm:1153641-1153643).
+    private const val REMOTE_VEL_X = 0x260L
+    private const val REMOTE_VEL_Y = 0x268L
+    // Fallback used by the drone getBodyVelocity implementations when the cpBody is
+    // absent: Enemy::setRemoteVelocity 0x61a3e8 stores +0x1d8/+0x1e0 (disasm:394488-394490);
+    // HawkDrone::getBodyVelocity fallback at 0x677388 (disasm:490905-490908).
+    private const val FALLBACK_VEL_X = 0x1d8L
+    private const val FALLBACK_VEL_Y = 0x1e0L
+    // Weapon::getDesignFiringPoint 0x948eb8 loads a stored muzzle offset from
+    // [weapon+0x2d0]/[weapon+0x2d8] (disasm:1239650) then composes node transforms.
+    // FILL: deriving the world muzzle externally needs the node transform chain,
+    // so prediction uses the soldier body position as the firing origin.
+
+    private const val MAX_TARGET_SPEED = 5000.0   // cocos points/s; rejects garbage fields
+    private const val VEL_EMA = 0.45              // smoothing on the resolved velocity
+    private const val ACCEL_EMA = 0.30            // smoothing on acceleration derived from velocity
+    private const val MAX_ACCEL = 20000.0         // cocos points/s^2; reject source-switch spikes
+    private const val VEL_MIN_DT_MS = 8L
+    private const val VEL_MAX_DT_MS = 250L
+    private const val MAX_LEAD_SECONDS = 1.5      // clamp so stale/fast fields cannot explode
+    private const val MAX_LEAD_DISTANCE = 900.0   // cocos points of displacement
+    private const val LEAD_ITERATIONS = 4
+    private const val RANGE_SAFETY_MARGIN = 20.0          // cocos points
+    private const val RANGE_SAFETY_FRACTION = 0.03        // or 3% of range, whichever is larger
 
     private val WEAPON_NAMES = arrayOf(
         "?", "MACHETE", "FRAGNADE", "DEAGLE", "MAGNUM", "UZI", "MP5", "AK47", "M16",
@@ -729,7 +866,101 @@ internal object MemoryPatcher {
         return sb.toString()
     }
 
-    // ---- aimlock ----
+    // ---- aimlock with iterative predictive lead ----
+
+    /** SoldierLocalController::fire 0x8ec46c reads primary (+0x1c8) and dual (+0x1d8). */
+    private fun activeWeapon(pid: Int, lc: Long): Long? =
+        readLong(pid, lc + LC_PRIMARY)?.takeIf { it != 0L }
+            ?: readLong(pid, lc + LC_DUAL)?.takeIf { it != 0L }
+
+    /** Weapon::getBulletSpeed 0x9487f0: int [w+0x2b4] x float [w+0x270] (disasm:1239176-1239180). */
+    private fun bulletSpeedOf(pid: Int, w: Long): Double {
+        val base = readInt(pid, w + W_SPEED_BASE)?.toDouble() ?: return 0.0
+        val mod = readFloat(pid, w + W_SPEED_MOD)?.toDouble() ?: return 0.0
+        val v = base * mod
+        return if (finite(v) && v in 1.0..100000.0) v else 0.0
+    }
+
+    /** Weapon::getRange 0x9485cc: uint16 [w+0x322] x float [w+0x26c] (disasm:1239009-1239013). */
+    private fun effectiveRangeOf(pid: Int, w: Long): Double {
+        val base = readU16(pid, w + W_RANGE_BASE)?.toDouble() ?: return 0.0
+        val mod = readFloat(pid, w + W_RANGE_MOD)?.toDouble() ?: return 0.0
+        val v = base * mod
+        return if (finite(v) && v in 1.0..100000.0) v else 0.0
+    }
+
+    private fun weaponNameOf(pid: Int, w: Long?): String {
+        if (w == null) return "-"
+        val type = readInt(pid, w + W_TYPE)
+        return type?.let { WEAPON_NAMES.getOrNull(it) } ?: "?"
+    }
+
+    private data class Lead(
+        val x: Double, val y: Double, val seconds: Double, val iterations: Int,
+    )
+
+    /** Iterative intercept: t = |target + v*t + a*t^2/2 - origin| / bulletSpeed, lead clamped. */
+    private fun intercept(
+        ox: Double, oy: Double, tx: Double, ty: Double,
+        vx: Double, vy: Double, ax: Double, ay: Double, speed: Double,
+    ): Lead {
+        if (speed <= 0.0 || !finite(speed)) return Lead(tx, ty, 0.0, 0)
+        var t = hypot(tx - ox, ty - oy) / speed
+        var px = tx
+        var py = ty
+        var iter = 0
+        while (iter < LEAD_ITERATIONS) {
+            iter++
+            val capped = t.coerceIn(0.0, MAX_LEAD_SECONDS)
+            var lx = vx * capped + 0.5 * ax * capped * capped
+            var ly = vy * capped + 0.5 * ay * capped * capped
+            val mag = hypot(lx, ly)
+            if (mag > MAX_LEAD_DISTANCE) {
+                val s = MAX_LEAD_DISTANCE / mag
+                lx *= s
+                ly *= s
+            }
+            px = tx + lx
+            py = ty + ly
+            val next = hypot(px - ox, py - oy) / speed
+            if (kotlin.math.abs(next - t) < 0.002) {
+                t = next
+                break
+            }
+            t = next
+        }
+        return Lead(px, py, t.coerceIn(0.0, MAX_LEAD_SECONDS), iter)
+    }
+
+    /** Live values surfaced in espDebugInfo() and throttled PatchLogger lines. */
+    private data class PredictSnapshot(
+        val weapon: String = "-",
+        val range: Double = 0.0,
+        val speed: Double = 0.0,
+        val targetKind: Int = -1,
+        val rawDist: Double = 0.0,
+        val vx: Double = 0.0,
+        val vy: Double = 0.0,
+        val velSrc: String = "-",
+        val ax: Double = 0.0,
+        val ay: Double = 0.0,
+        val travel: Double = 0.0,
+        val leadAngle: Float = Float.NaN,
+        val predictedDist: Double = 0.0,
+        val iterations: Int = 0,
+        val gateLimit: Double = 0.0,
+        val gatePass: Boolean? = null,
+    )
+    @Volatile private var aimPredict = PredictSnapshot()
+    @Volatile private var trigPredict = PredictSnapshot()
+    private val predictLogMs = ConcurrentHashMap<String, Long>()
+
+    private fun logPredict(tag: String, message: String) {
+        val now = System.currentTimeMillis()
+        if (now - (predictLogMs[tag] ?: 0L) < 2000L) return
+        predictLogMs[tag] = now
+        PatchLogger.log(tag, message)
+    }
 
     /** View sway must be zeroed or bullets fly off-angle even when the reticle is right. */
     private fun zeroSway(pid: Int, lc: Long) {
@@ -745,20 +976,38 @@ internal object MemoryPatcher {
         zeroSway(pid, lc)
         val origin = soldierPosition(pid, lc) ?: return Float.NaN
         losOrigin = origin
+        val w = activeWeapon(pid, lc)
+        val speed = w?.let { bulletSpeedOf(pid, it) } ?: 0.0
+        val range = w?.let { effectiveRangeOf(pid, it) } ?: 0.0
         var best = 4000.0
         var found = Float.NaN
-        for (t in collectTargets(pid, base)) {
+        var snap = PredictSnapshot(weapon = weaponNameOf(pid, w), range = range, speed = speed)
+        for (t in collectTargets(pid, base, withVelocity = true)) {
             if (t.friendly) continue
-            val dx = t.x - origin.first
-            val dy = t.y - origin.second
-            val dist = hypot(dx, dy)
-            if (dist < 10.0 || dist >= best) continue
-            best = dist
+            val rawDist = hypot(t.x - origin.first, t.y - origin.second)
+            if (rawDist < 10.0 || rawDist >= best) continue
+            best = rawDist
+            val lead = intercept(origin.first, origin.second, t.x, t.y, t.vx, t.vy, t.ax, t.ay, speed)
+            val dx = lead.x - origin.first
+            val dy = lead.y - origin.second
             var deg = (atan2(-dy, dx) * 180.0 / Math.PI).toFloat()
             if (deg < 0f) deg += 360f
             found = deg
+            // Keep the LOS probe on the target's real position: Wall Check semantics unchanged.
             losTarget = t.x to t.y
+            snap = snap.copy(
+                targetKind = t.kind, rawDist = rawDist, vx = t.vx, vy = t.vy, velSrc = t.velSrc,
+                ax = t.ax, ay = t.ay, travel = lead.seconds, leadAngle = deg,
+                predictedDist = hypot(dx, dy), iterations = lead.iterations,
+            )
         }
+        aimPredict = snap
+        logPredict("AIM",
+            "pred w=${snap.weapon} speed=${"%.0f".format(speed)} range=${"%.0f".format(range)} " +
+                "tgt=${snap.targetKind} d=${"%.0f".format(snap.rawDist)} " +
+                "v=${"%.0f".format(snap.vx)},${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
+                "tt=${"%.3f".format(snap.travel)} lead=${"%.0f".format(snap.predictedDist)} " +
+                "deg=${"%.1f".format(snap.leadAngle)} it=${snap.iterations}")
         return found
     }
 
@@ -780,6 +1029,7 @@ internal object MemoryPatcher {
             }
 
             aimRunning = true
+            PatchLogger.log("AIM", "predictive aimlock enabled (iterative lead ${LEAD_ITERATIONS}x)")
             aimThread = Thread {
                 while (aimRunning) {
                     val p = findPid()
@@ -1061,6 +1311,7 @@ internal object MemoryPatcher {
             lastFireMs = 0L
             firePulled = false
             triggerRunning = true
+            PatchLogger.log("TRIG", "range-gated triggerbot enabled")
 
             triggerThread = Thread {
                 var p = pid
@@ -1089,29 +1340,74 @@ internal object MemoryPatcher {
                         val native = if (joy != 0L) readFloat(cp, joy + JOY_ANGLE) else null
                         val angle = if (locked != null && !locked.isNaN()) locked else native
                         val origin = localPosition(cp, cb)
+                        val lc = localController(cp, cb)
+                        val w = lc?.let { activeWeapon(cp, it) }
+                        val speed = w?.let { bulletSpeedOf(cp, it) } ?: 0.0
+                        val range = w?.let { effectiveRangeOf(cp, it) } ?: 0.0
+                        // Unknown range fails open; known range stops short by a small margin.
+                        val margin = if (range > 0.0) maxOf(RANGE_SAFETY_MARGIN, range * RANGE_SAFETY_FRACTION) else 0.0
+                        val gateLimit = if (range > 0.0) maxOf(10.0, range - margin) else 4000.0
+                        var snap = PredictSnapshot(
+                            weapon = weaponNameOf(cp, w), range = range, speed = speed,
+                            gateLimit = gateLimit,
+                        )
 
-                        if (losVisible(cp, cb) == true && origin != null &&
-                            localController(cp, cb) != null && angle != null && joy != 0L
+                        if (losVisible(cp, cb) == true && origin != null && lc != null &&
+                            angle != null && joy != 0L
                         ) {
                             val rad = if (kotlin.math.abs(angle) > 6.283185f)
                                 Math.toRadians(angle.toDouble()) else angle.toDouble()
                             val dx = kotlin.math.cos(rad)
                             val dy = -kotlin.math.sin(rad)
-                            val target = collectTargets(cp, cb)
+                            val candidates = collectTargets(cp, cb, withVelocity = true)
                                 .filter {
                                     it.kind == KIND_DRONE || it.kind == KIND_HAWK ||
                                         it.kind == KIND_WORM || it.kind == KIND_PLAYER
                                 }
-                                .map { it to hypot(it.x - origin.first, it.y - origin.second) }
+                                .map { t ->
+                                    val raw = hypot(t.x - origin.first, t.y - origin.second)
+                                    val lead = intercept(
+                                        origin.first, origin.second, t.x, t.y, t.vx, t.vy, t.ax, t.ay, speed,
+                                    )
+                                    Triple(t, raw, lead)
+                                }
                                 .filter { it.second in 10.0..4000.0 }
-                                .minByOrNull { it.second }
-                            if (target != null && rayHitsBox(
-                                    origin.first, origin.second, dx, dy,
-                                    target.first.x, target.first.y,
-                                    halfW(target.first.kind), halfH(target.first.kind),
+                            val target = candidates.minByOrNull { it.second }
+                            if (target != null) {
+                                val t = target.first
+                                val lead = target.third
+                                val gateDist = hypot(lead.x - origin.first, lead.y - origin.second)
+                                // Both the live position and the intercept point must be inside
+                                // the projectile's travel limit, so a lead toward the shooter
+                                // cannot justify firing at an out-of-range target.
+                                val inRange = gateDist <= gateLimit && target.second <= gateLimit
+                                snap = snap.copy(
+                                    targetKind = t.kind, rawDist = target.second,
+                                    vx = t.vx, vy = t.vy, velSrc = t.velSrc,
+                                    ax = t.ax, ay = t.ay,
+                                    travel = lead.seconds, predictedDist = gateDist,
+                                    iterations = lead.iterations, gatePass = inRange,
                                 )
-                            ) shouldFire = true
+                                if (inRange) {
+                                    val hw = halfW(t.kind)
+                                    val hh = halfH(t.kind)
+                                    // Aimlock fires at the lead point; manual aim at the raw point.
+                                    val rawHit = rayHitsBox(
+                                        origin.first, origin.second, dx, dy, t.x, t.y, hw, hh,
+                                    )
+                                    val leadHit = rayHitsBox(
+                                        origin.first, origin.second, dx, dy, lead.x, lead.y, hw, hh,
+                                    )
+                                    if (rawHit || leadHit) shouldFire = true
+                                }
+                            }
                         }
+                        trigPredict = snap
+                        logPredict("TRIG",
+                            "gate=${snap.gatePass ?: false} w=${snap.weapon} range=${"%.0f".format(range)} " +
+                                "dist=${"%.0f".format(snap.predictedDist)} limit=${"%.0f".format(gateLimit)} " +
+                                "tgt=${snap.targetKind} v=${"%.0f".format(snap.vx)},${"%.0f".format(snap.vy)}[${snap.velSrc}] " +
+                                "tt=${"%.3f".format(snap.travel)} fire=$shouldFire")
 
                         val saved = savedFireState ?: 0
                         if (shouldFire && now - lastFireMs >= TRIGGER_COOLDOWN_MS) {
@@ -1298,6 +1594,17 @@ internal object MemoryPatcher {
         val povLc = readLong(pid, base + LOCAL_CONTROLLER_GLOBAL)?.let { readLong(pid, it) }
         sb.appendLine("POV: pct=$povPercent k=${"%.4f".format(povScale)} lc=${hx(povLc)} " +
             "zoom=${if (povLc != null) readFloat(pid, povLc + POV_LC_FIELD) else null}")
+        fun f1(v: Double) = "%.1f".format(v)
+        val a = aimPredict
+        sb.appendLine("PREDICT AIM: w=${a.weapon} speed=${f1(a.speed)} range=${f1(a.range)} " +
+            "tgt=${a.targetKind} d=${f1(a.rawDist)} v=${f1(a.vx)},${f1(a.vy)}[${a.velSrc}] " +
+            "a=${f1(a.ax)},${f1(a.ay)} tt=${"%.3f".format(a.travel)} lead=${f1(a.predictedDist)} " +
+            "deg=${"%.1f".format(a.leadAngle)} it=${a.iterations}")
+        val g = trigPredict
+        sb.appendLine("PREDICT TRIG: w=${g.weapon} range=${f1(g.range)} speed=${f1(g.speed)} " +
+            "tgt=${g.targetKind} d=${f1(g.rawDist)} v=${f1(g.vx)},${f1(g.vy)}[${g.velSrc}] " +
+            "a=${f1(g.ax)},${f1(g.ay)} tt=${"%.3f".format(g.travel)} lead=${f1(g.predictedDist)} " +
+            "limit=${f1(g.gateLimit)} gate=${g.gatePass}")
         sb.append(weaponInfo(pid, base))
         return sb.toString()
     }
