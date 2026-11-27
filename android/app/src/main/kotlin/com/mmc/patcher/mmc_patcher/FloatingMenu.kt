@@ -1,9 +1,17 @@
 package com.mmc.patcher.mmc_patcher
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
@@ -37,6 +45,7 @@ internal class FloatingMenu(private val activity: MainActivity) {
     private var icon: View? = null
     private var panel: View? = null
     private var expanded = false
+    private var guiHidden = false
     private var pid: Int? = null
     private var base: Long? = null
     private var debug: DebugOverlay? = null
@@ -112,21 +121,69 @@ internal class FloatingMenu(private val activity: MainActivity) {
         override fun onLowMemory() = Unit
     }
 
+    private val restoreAction = "com.mmc.patcher.mmc_patcher.RESTORE_GUI"
+    private val restoreChannelId = "mmc_patcher_gui_restore"
+    private val restoreNotificationId = 20261127
+    private val restoreRequestCode = 20261127
+    private val permissionRequestCode = 20261128
+    private var restoreReceiverRegistered = false
+    private var hidePending = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Dynamic registration keeps the restore path alive while the panel itself is gone. */
+    private val restoreReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (restoreAction != intent.action || !guiHidden) return
+            runCatching {
+                show()
+                togglePanel()
+                guiHidden = false
+                cancelRestoreNotification()
+            }.onFailure { PatchLogger.log("UI", "restore failed: ${it.message}") }
+        }
+    }
+
+    private fun notificationManager(): NotificationManager =
+        activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+    private fun registerRestoreReceiver() {
+        if (restoreReceiverRegistered) return
+        val filter = IntentFilter(restoreAction)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                activity.application.registerReceiver(restoreReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                activity.application.registerReceiver(restoreReceiver, filter)
+            }
+            restoreReceiverRegistered = true
+        }.onFailure { PatchLogger.log("UI", "restore receiver register failed: ${it.message}") }
+    }
+
+    private fun unregisterRestoreReceiver() {
+        if (!restoreReceiverRegistered) return
+        runCatching { activity.application.unregisterReceiver(restoreReceiver) }
+        restoreReceiverRegistered = false
+    }
+
     fun show() {
         if (icon != null) return
         activity.application.registerComponentCallbacks(configCallback)
+        registerRestoreReceiver()
         icon = buildIcon()
         wm.addView(icon, iconParams)
     }
 
     fun hide() {
         runCatching { activity.application.unregisterComponentCallbacks(configCallback) }
+        unregisterRestoreReceiver()
+        cancelRestoreNotification()
         runCatching { MemoryPatcher.abortJoinCapture() }
         icon?.let { runCatching { wm.removeView(it) } }
         panel?.let { runCatching { wm.removeView(it) } }
         icon = null
         panel = null
         expanded = false
+        guiHidden = false
         esp?.hide()
         esp = null
         debug?.hide()
@@ -321,16 +378,9 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 MemoryPatcher.uninstallLos(pid!!, base!!)
                 true
             } else {
-                if (states["aim"] != true) {
-                    if (!toggleAimlock(true)) {
-                        toast("Could not enable Aimlock")
-                        return@toggleRow false
-                    }
-                    states["aim"] = true
-                }
                 val installed = MemoryPatcher.installLos(pid!!, base!!)
                 if (installed) {
-                    toast("Aimlock + Wall Check ON")
+                    toast("Wall Check ON")
                     Handler(Looper.getMainLooper()).post { refreshPanel() }
                 }
                 installed
@@ -344,17 +394,6 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 states["trigger"] = false
                 toggleTriggerbot(false)
             } else {
-                if (states["aim"] != true) {
-                    if (!toggleAimlock(true)) { toast("Could not enable Aimlock"); return@toggleRow false }
-                    states["aim"] = true
-                }
-                if (states["los"] != true) {
-                    if (!MemoryPatcher.installLos(pid!!, base!!)) {
-                        toast("Could not enable Wall Check")
-                        return@toggleRow false
-                    }
-                    states["los"] = true
-                }
                 val ok = toggleTriggerbot(true)
                 if (ok) {
                     states["trigger"] = true
@@ -366,6 +405,10 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 ok
             }
         })
+        container.addView(toggleRow("autoMelee", "⚔", "Auto Melee",
+            "Lock and hit enemies within melee reach only") { checked ->
+            MemoryPatcher.toggleAutoMelee(checked)
+        })
         container.addView(toggleRow("autoGrenade", "✹", "Grenade Aim",
             "Ballistic aim on crouched enemies · tap HUD grenade to throw") { checked ->
             if (!ensureAttached()) {
@@ -375,17 +418,6 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 toggleAutoGrenade(false)
                 true
             } else {
-                if (states["aim"] != true) {
-                    if (!toggleAimlock(true)) { toast("Could not enable Aimlock"); return@toggleRow false }
-                    states["aim"] = true
-                }
-                if (states["los"] != true) {
-                    if (!MemoryPatcher.installLos(pid!!, base!!)) {
-                        toast("Could not enable Wall Check")
-                        return@toggleRow false
-                    }
-                    states["los"] = true
-                }
                 val ok = toggleAutoGrenade(true)
                 if (ok) {
                     toast("Grenade aim ON - tap HUD grenade to throw")
@@ -473,6 +505,20 @@ internal class FloatingMenu(private val activity: MainActivity) {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(10) }
             setOnClickListener { copyLogs() }
+        })
+
+        container.addView(TextView(activity).apply {
+            text = "◫  HIDE GUI"
+            caption(12f, Color.WHITE, bold = true)
+            gravity = Gravity.CENTER
+            letterSpacing = 0.06f
+            minimumHeight = dp(42)
+            background = pressable(Color.rgb(40, 43, 56), Color.rgb(58, 62, 78), dp(12).toFloat(), stroke)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(6) }
+            setOnClickListener { hideGui() }
         })
 
         scroll.addView(container, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -790,6 +836,99 @@ internal class FloatingMenu(private val activity: MainActivity) {
     }
 
     // ---- open / close ----------------------------------------------------
+
+    private fun cancelRestoreNotification() {
+        runCatching { notificationManager().cancel(restoreNotificationId) }
+    }
+
+    private fun notificationPermissionGranted(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+    @Suppress("DEPRECATION")
+    private fun postRestoreNotification(): Boolean {
+        val pending = PendingIntent.getBroadcast(
+            activity,
+            restoreRequestCode,
+            Intent(restoreAction).setPackage(activity.packageName),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = notificationManager()
+            if (manager.getNotificationChannel(restoreChannelId) == null) {
+                manager.createNotificationChannel(
+                    NotificationChannel(restoreChannelId, "MMC Patcher controls", NotificationManager.IMPORTANCE_LOW)
+                        .apply { description = "Tap to restore the hidden patcher controls" },
+                )
+            }
+        }
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(activity, restoreChannelId)
+        } else {
+            Notification.Builder(activity)
+        }
+        val notification = builder
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("MMC Patcher")
+            .setContentText("Tap to restore controls")
+            .setOngoing(true)
+            .setContentIntent(pending)
+            .build()
+        return runCatching { notificationManager().notify(restoreNotificationId, notification) }
+            .onFailure { PatchLogger.log("UI", "restore notification failed: ${it.message}") }
+            .isSuccess
+    }
+
+    /** Removes the badge and panel only; ESP, Debug and ESP Debug keep running. */
+    private fun hideGui() {
+        if (guiHidden || hidePending) return
+        if (!notificationPermissionGranted()) {
+            hidePending = true
+            val requested = runCatching {
+                activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), permissionRequestCode)
+            }.onFailure { PatchLogger.log("UI", "notification permission request failed: ${it.message}") }.isSuccess
+            if (!requested) {
+                hidePending = false
+                return
+            }
+            // MainActivity has no onRequestPermissionsResult hook, so observe the grant
+            // on the main looper. Bounded so a denial cannot leave a poller running.
+            mainHandler.postDelayed(object : Runnable {
+                private var attempts = 0
+                override fun run() {
+                    if (notificationPermissionGranted()) {
+                        hidePending = false
+                        finishHideGui()
+                    } else if (++attempts < 20) {
+                        mainHandler.postDelayed(this, 250)
+                    } else {
+                        hidePending = false
+                        PatchLogger.log("UI", "notification permission not granted - GUI left visible")
+                    }
+                }
+            }, 250)
+            toast("Grant notifications to hide the GUI")
+            return
+        }
+        finishHideGui()
+    }
+
+    private fun finishHideGui() {
+        if (guiHidden) return
+        // Never remove the last control surface before a restore notification exists.
+        if (!postRestoreNotification()) {
+            toast("Restore notification failed - GUI left visible")
+            PatchLogger.log("UI", "hide aborted - no restore notification posted")
+            return
+        }
+        icon?.let { runCatching { wm.removeView(it) } }
+        panel?.let { runCatching { wm.removeView(it) } }
+        icon = null
+        panel = null
+        expanded = false
+        guiHidden = true
+        PatchLogger.log("UI", "GUI hidden - overlays left running")
+    }
 
     @SuppressLint("SetTextI18n")
     private fun togglePanel() {

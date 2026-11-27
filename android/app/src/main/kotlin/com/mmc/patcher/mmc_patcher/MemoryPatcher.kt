@@ -62,6 +62,19 @@ internal object MemoryPatcher {
     private const val TARGET_LIB = "libcocos2dcpp.so"
 
     private const val FIRE_ANGLE_OFFSET = 0x6888f0L
+    private const val FIRE_ANGLE_LITERAL = 20L   // +0x14 in the getter patch: NaN = native angle
+    private const val ANGLE_PATCH_HEX = "008041BD8100001C2020211E207C201EC0035FD60000C07F"
+    private const val ANGLE_PROVIDER_AUTOMELEE = "automelee"
+    private const val ANGLE_PROVIDER_AIMLOCK = "aimlock"
+    private const val ANGLE_PROVIDER_LOS = "los"
+    private const val ANGLE_PROVIDER_GRENADE = "grenade"
+    // Distinct priorities: Auto Melee must win over Aimlock when both have a target,
+    // and Aimlock over LOS/Grenade. Ties would silently depend on toggle order, so
+    // no two providers share a value.
+    private const val ANGLE_PRIORITY_AUTOMELEE = 400
+    private const val ANGLE_PRIORITY_AIMLOCK = 300
+    private const val ANGLE_PRIORITY_LOS = 200
+    private const val ANGLE_PRIORITY_GRENADE = 100
     // Verified in cocos_new.so at file/vaddr offset 0x1084a18: 35 fa 8e bc =
     // float32 -0.017453292f = -PI/180. addBullet/addGrenade/addRocket/addShell/addSaw
     // all do rad = degrees * this constant, then fire along (cos(rad), sin(rad))
@@ -137,6 +150,11 @@ internal object MemoryPatcher {
     // Triggerbot: publish Joypad* from the proven LOS cave, then pull its fire byte.
     private const val JOY_FIRE_STATE = 0x18aL
     private const val JOY_ANGLE = 0x180L
+    // Stage+0x170 is the HUD (HUD::init stores Joypad* at +0x178, disasm:6640a8).
+    // Reading that chain gives Triggerbot a Joypad* when no cave is publishing one.
+    private const val STAGE_HUD_OFFSET = 0x170L
+    private const val HUD_JOYPAD_OFFSET = 0x178L
+    private const val JOYPAD_VTABLE = 0x1335030L   // _ZTV6Joypad (0x1335020) + 0x10
     private const val LOS_JOYPTR_SLOT = 0x58L
     private const val JOYPTR_BRANCH_HEX = "35000014"
     private const val JOYPTR_STUB_HEX = "E00300F909000090202D07F9C9FFFF17"
@@ -152,7 +170,7 @@ internal object MemoryPatcher {
 
     @Volatile private var triggerRunning = false
     private var triggerThread: Thread? = null
-    @Volatile private var joyPtrPublished = false
+    @Volatile private var joyPtrRefCount = 0
     private val joyPtrSaved = HashMap<Long, ByteArray>()
     private var savedFireState: Byte? = null
     private var lastFireMs = 0L
@@ -170,7 +188,6 @@ internal object MemoryPatcher {
     @Volatile private var losActive = false
     @Volatile private var losOrigin = Pair(0.0, 0.0)
     @Volatile private var losTarget = Pair(0.0, 0.0)
-    private val losSaved = HashMap<Long, ByteArray>()
 
     private const val ESP_ENGINE_HEX =
         "FF4303D1FD7B0BA9F35300A9F55B01A9F76302A9F96B03A9FB7304A9E827803DE06300F9F33E0010600640B920010035E00313AA00CC7492010084D2" +
@@ -201,8 +218,23 @@ internal object MemoryPatcher {
 
     private val espSaved = HashMap<Long, ByteArray>()
     private val originals = HashMap<Long, ByteArray>()
-    private var aimThread: Thread? = null
-    @Volatile private var aimRunning = false
+
+    // ---- angle override registry -----------------------------------------
+    // One owner of the getter hook, the literal and the tick that publishes it.
+    // Features register a provider and never write FIRE_ANGLE_OFFSET+20 directly.
+    private data class AngleProvider(
+        val id: String, val priority: Int, val provider: () -> Float,
+    )
+    private val angleLock = Any()
+    private val angleProviders = LinkedHashMap<String, AngleProvider>()
+    private val angleSaved = HashMap<Long, ByteArray>()   // game bytes at the getter, saved once
+    private val losSaved = HashMap<Long, ByteArray>()     // getter bytes before the LOS branch
+    @Volatile private var angleHookInstalled = false
+    @Volatile private var angleBranchInstalled = false    // LOS branch occupies the getter
+    @Volatile private var angleResolvedDeg = Float.NaN
+    @Volatile private var angleResolvedBy = "-"
+    @Volatile private var angleTicking = false
+    private var angleThread: Thread? = null
 
     fun findPid(): Int? {
         val procs = File("/proc").listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) }
@@ -337,6 +369,9 @@ internal object MemoryPatcher {
 
     private fun writeFloat(pid: Int, address: Long, value: Float): Boolean =
         writeBytes(pid, address, ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array())
+
+    private fun writeDouble(pid: Int, address: Long, value: Double): Boolean =
+        writeBytes(pid, address, ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putDouble(value).array())
 
     private fun writeViaShell(pid: Int, address: Long, bytes: ByteArray): Boolean {
         val octal = bytes.joinToString("") { "\\${(it.toInt() and 0xff).toString(8).padStart(3, '0')}" }
@@ -1378,75 +1413,185 @@ internal object MemoryPatcher {
         return found
     }
 
+    // ---- angle registry: hook ownership, resolution and publication --------
+
+    private fun startAngleTicker() {
+        if (angleTicking) return
+        angleTicking = true
+        angleThread = Thread {
+            while (angleTicking) {
+                try {
+                    publishResolvedAngle()
+                } catch (_: Throwable) {
+                    // Transient PID/base/scene change - retry next tick.
+                }
+                try {
+                    Thread.sleep(16)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }.apply { isDaemon = true; name = "angle-override"; start() }
+    }
+
+    private fun stopAngleTicker() {
+        angleTicking = false
+        angleThread?.interrupt()
+        try {
+            angleThread?.join(200)
+        } catch (_: InterruptedException) {
+            // Ignore.
+        }
+        angleThread = null
+    }
+
+    /** The getter carries the LOS branch while the cave is active, else the 24-byte patch. */
+    private fun desiredAngleHook(): ByteArray =
+        if (losActive) hexToBytes(LOS_BRANCH_HEX) else hexToBytes(ANGLE_PATCH_HEX)
+
+    /** Registers a finite-angle source. NaN from a provider means "abstain". */
+    fun registerAngleProvider(id: String, priority: Int, provider: () -> Float): Boolean {
+        synchronized(angleLock) {
+            val wasEmpty = angleProviders.isEmpty()
+            val wasBranch = angleBranchInstalled
+            angleProviders[id] = AngleProvider(id, priority, provider)
+            if (wasEmpty) {
+                val pid = findPid()
+                val base = pid?.let { findModuleBase(it) }
+                val address = base?.plus(FIRE_ANGLE_OFFSET)
+                val original = if (pid != null && address != null) readBytes(pid, address, 24) else null
+                if (pid == null || address == null || original == null ||
+                    !writeBytes(pid, address, desiredAngleHook())
+                ) {
+                    angleProviders.remove(id)
+                    PatchLogger.log("AIM", "angle hook install failed for $id")
+                    return false
+                }
+                angleSaved[address] = original
+                angleHookInstalled = true
+                angleBranchInstalled = losActive
+                startAngleTicker()
+            } else if (losActive != wasBranch) {
+                // Only the presence of the LOS cave changes the hook's shape.
+                val pid = findPid()
+                val base = pid?.let { findModuleBase(it) }
+                val address = base?.plus(FIRE_ANGLE_OFFSET)
+                if (pid == null || address == null) {
+                    angleProviders.remove(id)
+                    return false
+                }
+                if (losActive) {
+                    val prev = readBytes(pid, address, 24) ?: run {
+                        angleProviders.remove(id)
+                        return false
+                    }
+                    if (!writeBytes(pid, address, hexToBytes(LOS_BRANCH_HEX))) {
+                        angleProviders.remove(id)
+                        return false
+                    }
+                    losSaved[address] = prev
+                    angleBranchInstalled = true
+                } else {
+                    val prev = losSaved.remove(address) ?: hexToBytes(ANGLE_PATCH_HEX)
+                    if (!writeBytes(pid, address, prev)) {
+                        angleProviders.remove(id)
+                        return false
+                    }
+                    angleBranchInstalled = false
+                }
+            }
+            return true
+        }
+    }
+
+    fun unregisterAngleProvider(id: String) {
+        var stopTicker = false
+        synchronized(angleLock) {
+            if (angleProviders.remove(id) == null) return
+            stopTicker = angleProviders.isEmpty()
+            if (!stopTicker && angleBranchInstalled && !losActive) {
+                val pid = findPid()
+                val base = pid?.let { findModuleBase(it) }
+                val address = base?.plus(FIRE_ANGLE_OFFSET)
+                if (pid != null && address != null) {
+                    val prev = losSaved.remove(address) ?: hexToBytes(ANGLE_PATCH_HEX)
+                    if (writeBytes(pid, address, prev)) angleBranchInstalled = false
+                }
+            }
+        }
+        if (stopTicker) {
+            stopAngleTicker()
+            synchronized(angleLock) {
+                val pid = findPid()
+                val base = pid?.let { findModuleBase(it) }
+                val address = base?.plus(FIRE_ANGLE_OFFSET)
+                if (pid != null && address != null) {
+                    angleSaved.remove(address)?.let { writeBytes(pid, address, it) }
+                }
+                losSaved.clear()
+                angleHookInstalled = false
+                angleBranchInstalled = false
+            }
+            angleResolvedDeg = Float.NaN
+            angleResolvedBy = "-"
+        }
+    }
+
+    /** One tick: resolve the winner, write the literal, mirror it into the view and LOS cave. */
+    private fun publishResolvedAngle() {
+        if (!angleHookInstalled) return
+        val pid = findPid() ?: return
+        val base = findModuleBase(pid) ?: return
+        var winner: AngleProvider? = null
+        var angle = Float.NaN
+        synchronized(angleLock) {
+            for (p in angleProviders.values) {
+                val a = try {
+                    p.provider()
+                } catch (_: Throwable) {
+                    Float.NaN
+                }
+                val current = winner
+                if (a.isFinite() && (current == null || p.priority > current.priority)) {
+                    winner = p
+                    angle = a
+                }
+            }
+        }
+        writeFloat(pid, base + FIRE_ANGLE_OFFSET + FIRE_ANGLE_LITERAL, angle)
+        angleResolvedDeg = angle
+        angleResolvedBy = winner?.id ?: "-"
+        aimFlip = aimFlip.copy(writtenDeg = angle)
+        // The cave returns native [Joypad+0x180] when its segment query fails. That can
+        // point anywhere, including opposite the target, so surface that condition.
+        if (losActive && losVisible(pid, base) == false &&
+            (winner?.id == ANGLE_PROVIDER_AIMLOCK || winner?.id == ANGLE_PROVIDER_AUTOMELEE)
+        ) {
+            logPredict("AIMFLIP",
+                "LOS query failed - getter serving native joypad angle instead of written $angle deg")
+        }
+        // Sway/recoil suppression belongs to the features that take the aim angle;
+        // LOS-only and Grenade-only must not silently change the view's aim fields.
+        if (winner?.id == ANGLE_PROVIDER_AIMLOCK || winner?.id == ANGLE_PROVIDER_AUTOMELEE) {
+            val liveLc = localController(pid, base)
+            if (liveLc != null && liveLc != 0L) zeroSway(pid, liveLc, angle)
+        }
+        writeLosFrame(pid, base, angle)
+    }
+
     fun toggleAimlock(enable: Boolean): Boolean {
         if (enable) {
-            val pid = findPid() ?: return false
-            val base = findModuleBase(pid) ?: return false
-            val address = base + FIRE_ANGLE_OFFSET
-            val original = readBytes(pid, address, 24) ?: return false
-            originals[address] = original
-
-            // NaN in the literal slot means "no target" -> native joystick angle.
-            val patch = hexToBytes("008041BD8100001C2020211E207C201EC0035FD60000C07F")
-            if (!writeBytes(pid, address, patch)) return false
-            // Enabling aimlock after LOS must not clobber the probe's branch.
-            if (losActive) {
-                losSaved[address] = patch
-                if (!writeBytes(pid, address, hexToBytes(LOS_BRANCH_HEX))) return false
+            val ok = registerAngleProvider(ANGLE_PROVIDER_AIMLOCK, ANGLE_PRIORITY_AIMLOCK) {
+                val p = findPid()
+                val b = p?.let { findModuleBase(it) }
+                if (p == null || b == null) Float.NaN else aimAngle(p, b)
             }
-
-            aimRunning = true
-            PatchLogger.log("AIM", "direct aimlock enabled")
-            aimThread = Thread {
-                while (aimRunning) {
-                    val p = findPid()
-                    val b = p?.let { findModuleBase(it) }
-                    if (p != null && b != null) {
-                        val aim = aimAngle(p, b)
-                        val override = grenadeOverrideAngle
-                        val angle = if (override.isNaN()) aim else override
-                        writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, angle)
-                        aimFlip = aimFlip.copy(writtenDeg = angle)
-                        // The LOS cave returns native [Joypad+0x180] instead of the
-                        // literal when its segment query fails. That can point anywhere,
-                        // including opposite the target, so surface the condition.
-                        if (losActive && losVisible(p, b) == false && override.isNaN()) {
-                            logPredict("AIMFLIP",
-                                "LOS query failed - getter serving native joypad angle " +
-                                    "instead of written $angle deg")
-                        }
-                        // Publish the same angle into the view's firing-angle base so
-                        // bullets (SoldierView::getFiringAngle) cannot lag the reticle
-                        // by one sight-update frame. NaN is left for native control.
-                        val liveLc = localController(p, b)
-                        if (liveLc != null && liveLc != 0L) zeroSway(p, liveLc, angle)
-                        writeLosFrame(p, b, angle)
-                    }
-                    try {
-                        Thread.sleep(16)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                }
-            }.apply { isDaemon = true; start() }
-            return true
-        } else {
-            val losPid = findPid()
-            val losBase = losPid?.let { findModuleBase(it) }
-            if (losPid != null && losBase != null) uninstallLos(losPid, losBase)
-            aimRunning = false
-            aimThread?.interrupt()
-            try {
-                aimThread?.join(200)
-            } catch (_: InterruptedException) {
-                // Ignore.
-            }
-            aimThread = null
-            val pid = findPid() ?: return false
-            val base = findModuleBase(pid) ?: return false
-            val original = originals.remove(base + FIRE_ANGLE_OFFSET) ?: return false
-            return writeBytes(pid, base + FIRE_ANGLE_OFFSET, original)
+            if (ok) PatchLogger.log("AIM", "direct aimlock enabled")
+            return ok
         }
+        unregisterAngleProvider(ANGLE_PROVIDER_AIMLOCK)
+        PatchLogger.log("AIM", "aimlock disabled")
+        return true
     }
 
     // ---- internal ESP (drawn inside Stage::draw, no per-frame syscalls) ----
@@ -1527,14 +1672,33 @@ internal object MemoryPatcher {
 
     // ---- line of sight ---------------------------------------------------
 
-    /** Installs a code-cave LOS probe behind the aimlock getter. Requires aimlock on. */
+    /** LOS supplies its own angle for the nearest visible hostile; NaN abstains. */
+    private fun losAngle(): Float {
+        if (!losActive) return Float.NaN
+        val pid = findPid() ?: return Float.NaN
+        val base = findModuleBase(pid) ?: return Float.NaN
+        val lc = writableLocalController(pid, base) ?: return Float.NaN
+        val origin = soldierPosition(pid, lc) ?: return Float.NaN
+        losOrigin = origin
+        var best = 4000.0
+        var found = Float.NaN
+        for (t in collectTargets(pid, base)) {
+            if (t.friendly) continue
+            val dx = t.x - origin.first
+            val dy = t.y - origin.second
+            val dist = hypot(dx, dy)
+            if (dist < 10.0 || dist >= best) continue
+            best = dist
+            found = normalizeDeg(atan2(-dy, dx))
+            losTarget = t.x to t.y
+        }
+        if (found.isNaN() || losVisible(pid, base) != true) return Float.NaN
+        return found
+    }
+
+    /** Installs the cave probe and registers its own angle provider. No aimlock required. */
     fun installLos(pid: Int, base: Long): Boolean {
         if (losActive) return true
-        val address = base + FIRE_ANGLE_OFFSET
-        if (!originals.containsKey(address)) {
-            PatchLogger.log("LOS", "enable aimlock first")
-            return false
-        }
         val engine = hexToBytes(LOS_ENGINE_HEX)
         val existing = readBytes(pid, base + LOS_CODE_OFFSET, 4)
         val ours = existing != null && existing.contentEquals(engine.copyOfRange(0, 4))
@@ -1542,8 +1706,6 @@ internal object MemoryPatcher {
             PatchLogger.log("LOS", "LOS cave occupied by unknown bytes")
             return false
         }
-        val stub = hexToBytes(LOS_BRANCH_HEX)
-        val prev = readBytes(pid, address, 24) ?: return false
         val data = ByteBuffer.allocate(0xa0).order(ByteOrder.LITTLE_ENDIAN)
         data.putInt(1)                       // flags: enabled
         data.putInt(0)                       // visible
@@ -1562,9 +1724,15 @@ internal object MemoryPatcher {
         repeat(4) { data.putLong(0) }        // 32-byte zeroed query info
         if (!writeBytes(pid, base + LOS_DATA_OFFSET, data.array())) return false
         if (!writeBytes(pid, base + LOS_CODE_OFFSET, engine)) return false
-        if (!writeBytes(pid, address, stub)) return false
-        losSaved[address] = prev
         losActive = true
+        if (!registerAngleProvider(ANGLE_PROVIDER_LOS, ANGLE_PRIORITY_LOS) { losAngle() }) {
+            losActive = false
+            runCatching {
+                writeBytes(pid, base + LOS_CODE_OFFSET, ByteArray(engine.size))
+                writeBytes(pid, base + LOS_DATA_OFFSET, ByteArray(0xa0))
+            }
+            return false
+        }
         PatchLogger.log("LOS", "installed")
         return true
     }
@@ -1589,16 +1757,11 @@ internal object MemoryPatcher {
     val triggerActive: Boolean get() = triggerRunning
 
     fun uninstallLos(pid: Int, base: Long) {
-        // The grenade hook patches updateStep independently of the LOS cave; tear it
-        // down first so disabling Wall Check cannot leave an armed throw behind.
-        if (autoGrenadeEnabled) toggleAutoGrenade(false)
         if (!losActive) return
-        if (triggerRunning) toggleTriggerbot(false)
-        unpublishJoypadPointer(pid, base)
+        // Drop the branch before clearing the cave: the registry decides whether the
+        // getter returns to the plain hook (other providers alive) or the game bytes.
         losActive = false
-        val address = base + FIRE_ANGLE_OFFSET
-        losSaved.remove(address)?.let { writeBytes(pid, address, it) }
-        // Clear our own cave so a later toggle can install cleanly.
+        unregisterAngleProvider(ANGLE_PROVIDER_LOS)
         runCatching {
             writeBytes(pid, base + LOS_CODE_OFFSET, ByteArray(hexToBytes(LOS_ENGINE_HEX).size))
             writeBytes(pid, base + LOS_DATA_OFFSET, ByteArray(0xa0))
@@ -1614,33 +1777,71 @@ internal object MemoryPatcher {
 
     // ---- triggerbot ------------------------------------------------------
 
+    /** Shared, refcounted leaf stub: any feature may publish Joypad* when the cave exists. */
     private fun publishJoypadPointer(pid: Int, base: Long): Boolean {
-        if (joyPtrPublished) return true
-        if (!losActive) return false
+        if (joyPtrRefCount > 0) {
+            joyPtrRefCount++
+            return true
+        }
         val code = base + LOS_CODE_OFFSET
         val orig = readBytes(pid, code + 4, 4) ?: return false
-        if (!orig.contentEquals(hexToBytes("E00300F9"))) {
-            PatchLogger.log("TRIG", "unexpected LOS cave prologue")
+        // The stub is only valid when real cave code is present; with no cave the
+        // branch would land in empty memory.
+        if (!orig.contentEquals(hexToBytes("E00300F9"))) return false
+        if (!writeBytes(pid, code + 4, hexToBytes(JOYPTR_BRANCH_HEX))) return false
+        if (!writeBytes(pid, code + 0xd8, hexToBytes(JOYPTR_STUB_HEX))) {
+            writeBytes(pid, code + 4, orig)
             return false
         }
-        if (!writeBytes(pid, code + 4, hexToBytes(JOYPTR_BRANCH_HEX))) return false
-        if (!writeBytes(pid, code + 0xd8, hexToBytes(JOYPTR_STUB_HEX))) return false
         joyPtrSaved[code + 4] = orig
-        joyPtrPublished = true
+        joyPtrRefCount = 1
         return true
     }
 
     private fun unpublishJoypadPointer(pid: Int, base: Long) {
-        if (!joyPtrPublished) return
+        if (joyPtrRefCount == 0) return
+        joyPtrRefCount--
+        if (joyPtrRefCount > 0) return
         val code = base + LOS_CODE_OFFSET
         joyPtrSaved.remove(code + 4)?.let { writeBytes(pid, code + 4, it) }
         writeBytes(pid, code + 0xd8, ByteArray(16))
-        joyPtrPublished = false
     }
 
-    private fun joypadPointer(pid: Int, base: Long): Long? =
-        if (!joyPtrPublished) null
-        else readLong(pid, base + LOS_DATA_OFFSET + LOS_JOYPTR_SLOT)?.takeIf { it != 0L }
+    // Reject null-page and non-canonical addresses before chasing a pointer read.
+    // Reads are preads on /proc/<pid>/mem, so a bogus hop fails closed as null rather
+    // than faulting this process; the check keeps that failure cheap and predictable.
+    private fun validRemotePtr(p: Long): Boolean =
+        p > 0x1000L && p < 0x0100_0000_0000_0000L
+
+    /** Cave slot first; otherwise walk the scene graph for Stage -> HUD -> Joypad. */
+    private fun joypadPointer(pid: Int, base: Long): Long? {
+        if (joyPtrRefCount > 0) {
+            readLong(pid, base + LOS_DATA_OFFSET + LOS_JOYPTR_SLOT)
+                ?.takeIf { it != 0L && joypadUsable(pid, it) }?.let { return it }
+        }
+        val director = readLong(pid, base + DIRECTOR_GLOBAL)?.takeIf(::validRemotePtr) ?: return null
+        val scene = readLong(pid, director + 0xa0)?.takeIf(::validRemotePtr) ?: return null
+        val queue = ArrayDeque<Pair<Long, Int>>()
+        queue.addLast(scene to 0)
+        val seen = HashSet<Long>()
+        var visited = 0
+        while (queue.isNotEmpty() && visited++ < 256) {
+            val (node, depth) = queue.removeFirst()
+            if (!validRemotePtr(node) || !seen.add(node)) continue
+            val hud = readLong(pid, node + STAGE_HUD_OFFSET)?.takeIf(::validRemotePtr)
+            if (hud != null) {
+                val jp = readLong(pid, hud + HUD_JOYPAD_OFFSET)?.takeIf(::validRemotePtr)
+                // Vtables are relocated with the library: value - base == RVA.
+                // joypadUsable gates the same ray the triggerbot will trace, so a
+                // stale/false-positive object cannot leave a NaN angle in play.
+                if (jp != null && readLong(pid, jp)?.minus(base) == JOYPAD_VTABLE &&
+                    joypadUsable(pid, jp)
+                ) return jp
+            }
+            if (depth < 5) for (ch in children(pid, node)) queue.addLast(ch to depth + 1)
+        }
+        return null
+    }
 
     /** The cave republishes Joypad* each frame, but after a scene swap it can be stale. */
     private fun joypadUsable(pid: Int, jp: Long): Boolean {
@@ -1695,8 +1896,8 @@ internal object MemoryPatcher {
         if (enable) {
             val pid = findPid() ?: return false
             val base = findModuleBase(pid) ?: return false
-            if (!losActive) { PatchLogger.log("TRIG", "enable Wall Check first"); return false }
-            if (!publishJoypadPointer(pid, base)) return false
+            // Best-effort cave publication; the scene-derived pointer works without LOS.
+            publishJoypadPointer(pid, base)
 
             var jp = 0L
             for (i in 0 until 20) {
@@ -2175,10 +2376,11 @@ internal object MemoryPatcher {
         PatchLogger.log("GREN", "hook UNINSTALLED - branch/cave/data restored")
     }
 
-    /** Publishes the ballistic angle before the one-shot arm so the cave cannot read a stale aim. */
+    /** Arms the throw after the registry has published the ballistic angle. */
     private fun armGrenadeThrow(pid: Int, base: Long, angleDeg: Float) {
         if (!grenadeHookInstalled || grenadeHookBase != base) return
-        writeFloat(pid, base + FIRE_ANGLE_OFFSET + 20, angleDeg)
+        grenadeOverrideAngle = angleDeg
+        publishResolvedAngle()
         writeBytes(
             pid,
             base + GREN_DATA_OFFSET + GREN_D_FLAGS,
@@ -2209,6 +2411,7 @@ internal object MemoryPatcher {
             // Kill switch: stop arming first, then restore every byte we patched.
             grenadeOverrideAngle = Float.NaN
             grenadeThrowRequested = false
+            unregisterAngleProvider(ANGLE_PROVIDER_GRENADE)
             val p = findPid()
             val b = p?.let { findModuleBase(it) }
             uninstallGrenadeHook(p, b)
@@ -2226,6 +2429,9 @@ internal object MemoryPatcher {
         // call twice with an identical fault address, because the arc solver can
         // produce a >90 s backward launch. Ballistic aim stays external and safe;
         // the operator completes the throw with the real HUD grenade button.
+        if (!registerAngleProvider(ANGLE_PROVIDER_GRENADE, ANGLE_PRIORITY_GRENADE) {
+                grenadeOverrideAngle
+            }) return false
         autoGrenadeEnabled = true
         lastGrenadeMs = 0L
         grenadeCountBefore = -1
@@ -2270,36 +2476,33 @@ internal object MemoryPatcher {
                     if (origin != null && sceneStable(p, b)) {
                         val enemies = collectTargets(p, b, withVelocity = true)
                             .filter { it.kind == KIND_PLAYER && !it.friendly }
-                        // The proven LOS cave probes only the aimlock's nearest target,
-                        // so the crouched enemy must be that same nearest enemy.
+                        // Grenade Aim selects and solves its own target; it does not
+                        // borrow the LOS cave's target or visibility decision.
                         val target = enemies.minByOrNull {
                             hypot(it.x - origin.first, it.y - origin.second)
                         }
                         val duckCount = enemies.count { it.crouched }
                         if (target != null && target.crouched) {
                             val rawDist = hypot(target.x - origin.first, target.y - origin.second)
-                            val visible = losVisible(p, b) == true
                             val arc = solveGrenadeArc(
                                 origin.first, origin.second, target.x, target.y,
                                 localVel?.first ?: 0.0, localVel?.second ?: 0.0,
                                 GRENADE_THROW_SPEED, gravity,
                             )
-                            val inRange = rawDist <= GRENADE_MAX_RANGE && arc.reachable && visible
+                            val inRange = rawDist <= GRENADE_MAX_RANGE && arc.reachable
                             val haveGrenade = (count ?: 0) > 0
                             grenadeFailReason = when {
                                 !haveGrenade -> "no grenades (count=$count)"
-                                !visible -> "LOS blocked"
                                 !arc.reachable -> "arc unreachable d=${"%.0f".format(rawDist)}"
                                 else -> "-"
                             }
                             if (inRange && haveGrenade) {
+                                // The provider publishes this on the next registry tick.
                                 grenadeOverrideAngle = arc.angleDeg
                                 autoGrenadeArmed = true
                                 grenadeCountBefore = count ?: -1
                                 if (now - lastGrenadeMs >= GRENADE_COOLDOWN_MS) {
-                                    // Pure memory write: publish the solved angle and signal
-                                    // readiness. No game code is called from a cave.
-                                    writeFloat(p, b + FIRE_ANGLE_OFFSET + 20, arc.angleDeg)
+                                    publishResolvedAngle()
                                     grenadeThrowRequested = true
                                     lastGrenadeMs = now
                                 }
@@ -2307,7 +2510,6 @@ internal object MemoryPatcher {
                                 autoGrenadeArmed = false
                             }
                             snap = "crouch=true d=${"%.0f".format(rawDist)} " +
-                                "los=${if (visible) "yes" else "no"} " +
                                 "before=$grenadeCountBefore after=$grenadeCountAfter " +
                                 "ang=${"%.1f".format(arc.angleDeg)} " +
                                 "t=${"%.2f".format(arc.flightSeconds)} " +
@@ -2345,6 +2547,134 @@ internal object MemoryPatcher {
         val v = grenadeThrowRequested
         grenadeThrowRequested = false
         return v
+    }
+
+    // ---- auto melee -------------------------------------------------------
+    // RE-verified attacker melee fields on SoldierLocalController. Everything this
+    // feature touches lives behind writableLocalController() and a validated body.
+    private const val LC_MELEE_FLAG = 0x1f6L
+    private const val LC_MELEE_POS_X = 0x1f8L
+    private const val LC_MELEE_POS_Y = 0x200L
+    private const val LC_MELEE_ANGLE = 0x208L
+
+    @Volatile var autoMeleeEnabled = false
+        private set
+    @Volatile private var autoMeleeReach = 20.0
+    @Volatile private var autoMeleeNearest = Double.NaN
+    @Volatile private var autoMeleeState = "off"
+    @Volatile private var autoMeleeAngle = Float.NaN
+    @Volatile private var autoMeleeRunning = false
+    private var autoMeleeThread: Thread? = null
+
+    /** Primary weapon only; MACHETE has a fixed 40-unit reach, no dual-wield modifier. */
+    private fun autoMeleeReachOf(pid: Int, lc: Long): Double {
+        val w = readLong(pid, lc + LC_PRIMARY) ?: return 20.0
+        if (w == 0L) return 20.0
+        if (readInt(pid, w + W_TYPE) == 1) return 40.0
+        return (readInt(pid, w + W_MELEE_LEN)?.toDouble() ?: 20.0).coerceIn(1.0, 200.0)
+    }
+
+    /** Nearest hostile inside reach; hit fields are re-armed every tick while in reach. */
+    private fun autoMeleeTick() {
+        val pid = findPid()
+        val base = pid?.let { findModuleBase(it) }
+        if (pid == null || base == null) {
+            autoMeleeAngle = Float.NaN
+            autoMeleeState = "detached"
+            return
+        }
+        val lc = writableLocalController(pid, base)
+        if (lc == null) {
+            autoMeleeAngle = Float.NaN
+            autoMeleeState = "scene"
+            return
+        }
+        val reach = autoMeleeReachOf(pid, lc)
+        autoMeleeReach = reach
+        val body = readLong(pid, lc + 0x1a8)?.takeIf { it != 0L }
+        val origin = soldierPosition(pid, lc)
+        val pos = body?.let { bodyPosition(pid, it) }
+        if (body == null || origin == null || pos == null) {
+            autoMeleeAngle = Float.NaN
+            autoMeleeState = "body"
+            return
+        }
+        var best = Double.NaN
+        var deg = Float.NaN
+        for (t in collectTargets(pid, base)) {
+            if (t.friendly) continue
+            val dx = t.x - origin.first
+            val dy = t.y - origin.second
+            val d = hypot(dx, dy)
+            if (d > reach || (!best.isNaN() && d >= best)) continue
+            best = d
+            deg = normalizeDeg(atan2(-dy, dx))
+        }
+        autoMeleeNearest = best
+        if (deg.isNaN()) {
+            autoMeleeAngle = Float.NaN
+            autoMeleeState = "no target reach=${"%.1f".format(reach)}"
+            return
+        }
+        // endMeleeAttack clears the flag after each swing, so assert it every tick.
+        val ok = writeBytes(pid, lc + LC_MELEE_FLAG, byteArrayOf(1)) and
+            writeDouble(pid, lc + LC_MELEE_POS_X, pos.first) and
+            writeDouble(pid, lc + LC_MELEE_POS_Y, pos.second) and
+            writeFloat(pid, lc + LC_MELEE_ANGLE, 0f)
+        autoMeleeAngle = deg
+        autoMeleeState = if (ok) "armed" else "write-failed"
+        logPredict("MELEE",
+            "reach=${"%.1f".format(reach)} d=${"%.1f".format(best)} deg=${"%.1f".format(deg)} $autoMeleeState")
+    }
+
+    /** Fully self-contained: its own provider, its own thread, no other feature's state. */
+    fun toggleAutoMelee(enable: Boolean): Boolean {
+        if (enable) {
+            if (autoMeleeEnabled) return true
+            if (findPid() == null) return false
+            autoMeleeAngle = Float.NaN
+            if (!registerAngleProvider(ANGLE_PROVIDER_AUTOMELEE, ANGLE_PRIORITY_AUTOMELEE) {
+                    autoMeleeAngle
+                }) return false
+            autoMeleeEnabled = true
+            autoMeleeRunning = true
+            autoMeleeThread = Thread {
+                while (autoMeleeRunning) {
+                    try {
+                        autoMeleeTick()
+                    } catch (_: Throwable) {
+                        autoMeleeState = "loop"
+                    }
+                    try {
+                        Thread.sleep(16)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }.apply { isDaemon = true; name = "auto-melee"; start() }
+            PatchLogger.log("MELEE", "auto melee enabled")
+            return true
+        }
+        if (!autoMeleeEnabled) return true
+        autoMeleeRunning = false
+        autoMeleeThread?.interrupt()
+        try {
+            autoMeleeThread?.join(200)
+        } catch (_: InterruptedException) {
+            // Ignore.
+        }
+        autoMeleeThread = null
+        autoMeleeAngle = Float.NaN
+        unregisterAngleProvider(ANGLE_PROVIDER_AUTOMELEE)
+        val pid = findPid()
+        val base = pid?.let { findModuleBase(it) }
+        if (pid != null && base != null) {
+            writableLocalController(pid, base)?.let { writeBytes(pid, it + LC_MELEE_FLAG, byteArrayOf(0)) }
+        }
+        autoMeleeEnabled = false
+        autoMeleeState = "off"
+        PatchLogger.log("MELEE", "auto melee disabled")
+        return true
     }
 
     /** Everything needed to diagnose external-ESP alignment, logged every ~2 s. */
@@ -2529,6 +2859,10 @@ internal object MemoryPatcher {
         sb.appendLine("GREN CAVE: $grenadeDiag")
         sb.appendLine("GREN COUNT: before=$grenadeCountBefore after=$grenadeCountAfter " +
             "requested=$grenadeThrowRequested reason=$grenadeFailReason")
+        sb.appendLine("AUTOMELEE: enabled=$autoMeleeEnabled reach=${f1(autoMeleeReach)} " +
+            "nearest=${f1(autoMeleeNearest)} state=$autoMeleeState " +
+            "angle=${f1(autoMeleeAngle.toDouble())} resolvedBy=$angleResolvedBy " +
+            "written=${f1(angleResolvedDeg.toDouble())}")
         players.take(8).forEach { ctrl ->
             val flag = readBytes(pid, ctrl + CTRL_DUCKED, 1)?.get(0)?.toInt()
             val shape = readInt(pid, ctrl + CTRL_DUCKED_SHAPE)
