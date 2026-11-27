@@ -189,6 +189,29 @@ internal object MemoryPatcher {
     @Volatile private var losOrigin = Pair(0.0, 0.0)
     @Volatile private var losTarget = Pair(0.0, 0.0)
 
+    // The cave's +0x04 slot can flap for one frame. Only a confirmed run of the
+    // same value flips our view of visibility; the cave's own fallback (serve native
+    // Joypad angle when its segment query fails) is untouched and authoritative.
+    private const val LOS_VISIBLE_STABLE_SAMPLES = 3
+    // losVisible() is called from the angle ticker, the trigger loop and diagnostics.
+    // Sample at most once per frame so their combined calls cannot satisfy the
+    // 3-sample run inside a single 16 ms tick.
+    private const val LOS_SAMPLE_WINDOW_MS = 16L
+    private val losGateLock = Any()
+    @Volatile private var losVisibleStable: Boolean? = null
+    private var losVisiblePending: Boolean? = null
+    private var losVisibleRun = 0
+    private var losGateSampleAtMs = 0L
+
+    private fun resetLosGate() {
+        synchronized(losGateLock) {
+            losVisibleStable = null
+            losVisiblePending = null
+            losVisibleRun = 0
+            losGateSampleAtMs = 0L
+        }
+    }
+
     private const val ESP_ENGINE_HEX =
         "FF4303D1FD7B0BA9F35300A9F55B01A9F76302A9F96B03A9FB7304A9E827803DE06300F9F33E0010600640B920010035E00313AA00CC7492010084D2" +
         "E20080D2701E40F900023FD620008052600600B9E06340F9FF8300D11D2110947C0240B97C0A0034E06340F9612A40F91F0001EB20010054602A00F9" +
@@ -223,7 +246,7 @@ internal object MemoryPatcher {
     // One owner of the getter hook, the literal and the tick that publishes it.
     // Features register a provider and never write FIRE_ANGLE_OFFSET+20 directly.
     private data class AngleProvider(
-        val id: String, val priority: Int, val provider: () -> Float,
+        val id: String, val priority: Int, val provider: (TargetTick) -> Float,
     )
     private val angleLock = Any()
     private val angleProviders = LinkedHashMap<String, AngleProvider>()
@@ -236,7 +259,31 @@ internal object MemoryPatcher {
     @Volatile private var angleTicking = false
     private var angleThread: Thread? = null
 
-    fun findPid(): Int? {
+    // ---- shared process / target caches ------------------------------------
+    // Four daemon threads poll /proc every 16 ms. A short TTL removes the repeated
+    // full cmdline/maps scans; any detected scene or PID change invalidates it so a
+    // relaunch is never served stale addresses.
+    private const val PROC_CACHE_TTL_MS = 300L
+    private const val TARGET_TICK_TTL_MS = 16L
+    private data class ProcCache(val pid: Int, val base: Long?, val atMs: Long)
+    private val procCacheLock = Any()
+    @Volatile private var procCache: ProcCache? = null
+
+    internal data class TargetTick(
+        val pid: Int, val base: Long, val targets: List<EspTarget>, val atMs: Long,
+    )
+    private val targetTickLock = Any()
+    @Volatile private var targetTick: TargetTick? = null
+
+    private fun invalidateProcCache() {
+        synchronized(procCacheLock) { procCache = null }
+    }
+
+    private fun invalidateTargetTick() {
+        synchronized(targetTickLock) { targetTick = null }
+    }
+
+    private fun scanPid(): Int? {
         val procs = File("/proc").listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) }
             ?: return null
         for (dir in procs) {
@@ -251,7 +298,7 @@ internal object MemoryPatcher {
         return null
     }
 
-    fun findModuleBase(pid: Int, lib: String = TARGET_LIB): Long? {
+    private fun scanModuleBase(pid: Int, lib: String): Long? {
         var result: Long? = null
         try {
             File("/proc/$pid/maps").forEachLine { line ->
@@ -264,6 +311,37 @@ internal object MemoryPatcher {
             // Unreadable maps.
         }
         return result
+    }
+
+    fun findPid(): Int? {
+        val now = System.currentTimeMillis()
+        val cached = procCache
+        if (cached != null && now - cached.atMs < PROC_CACHE_TTL_MS &&
+            File("/proc/${cached.pid}").exists()) return cached.pid
+        val pid = scanPid() ?: return null
+        synchronized(procCacheLock) {
+            val c = procCache
+            procCache = ProcCache(pid, c?.base?.takeIf { c.pid == pid }, System.currentTimeMillis())
+        }
+        return pid
+    }
+
+    fun findModuleBase(pid: Int, lib: String = TARGET_LIB): Long? {
+        if (lib != TARGET_LIB) return scanModuleBase(pid, lib)
+        val now = System.currentTimeMillis()
+        val cached = procCache
+        if (cached != null && cached.pid == pid && cached.base != null &&
+            now - cached.atMs < PROC_CACHE_TTL_MS) return cached.base
+        val base = scanModuleBase(pid, TARGET_LIB) ?: return null
+        synchronized(procCacheLock) {
+            val c = procCache
+            procCache = if (c == null || c.pid != pid) {
+                ProcCache(pid, base, System.currentTimeMillis())
+            } else {
+                c.copy(base = base, atMs = System.currentTimeMillis())
+            }
+        }
+        return base
     }
 
     fun attach(): Pair<Int, Long>? {
@@ -509,6 +587,7 @@ internal object MemoryPatcher {
 
     @Volatile private var lastScene = 0L
     @Volatile private var sceneSettleUntil = 0L
+    @Volatile private var sceneWasSettling = false
 
     private fun sceneStable(pid: Int, base: Long): Boolean {
         val director = readLong(pid, base + DIRECTOR_GLOBAL) ?: return false
@@ -518,9 +597,23 @@ internal object MemoryPatcher {
         if (scene != lastScene) {
             lastScene = scene
             sceneSettleUntil = now + SCENE_SETTLE_MS
+            sceneWasSettling = true
+            // A new scene invalidates every snapshot tied to the old one.
+            aimPredict = PredictSnapshot()
+            invalidateTargetTick()
+            invalidateProcCache()
+            resetLosGate()
             return false
         }
-        return now >= sceneSettleUntil
+        if (now < sceneSettleUntil) return false
+        if (sceneWasSettling) {
+            sceneWasSettling = false
+            // Settle just completed: drop anything sampled while writes were paused.
+            // The next aim tick republishes a fresh prediction from the live scene.
+            aimPredict = PredictSnapshot()
+            invalidateTargetTick()
+        }
+        return true
     }
 
     /** Non-null only for a live SoldierLocalController that is safe to write into. */
@@ -579,6 +672,29 @@ internal object MemoryPatcher {
             out.add(t)
         }
         return out
+    }
+
+    /**
+     * One immutable target snapshot per tick, shared by aimlock, LOS, auto melee,
+     * triggerbot and grenade aim. Collected outside angleLock so /proc reads never
+     * run while the registry is locked. A PID/base change or a scene transition
+     * invalidates the snapshot explicitly.
+     */
+    private fun targetsFor(pid: Int, base: Long): TargetTick {
+        val now = System.currentTimeMillis()
+        val cached = targetTick
+        if (cached != null && cached.pid == pid && cached.base == base &&
+            now - cached.atMs < TARGET_TICK_TTL_MS) return cached
+        synchronized(targetTickLock) {
+            val cur = targetTick
+            if (cur != null && cur.pid == pid && cur.base == base &&
+                System.currentTimeMillis() - cur.atMs < TARGET_TICK_TTL_MS) return cur
+            // Velocity is a superset of the plain view; one pass feeds every consumer.
+            val targets = collectTargets(pid, base, withVelocity = true).toList()
+            val fresh = TargetTick(pid, base, targets, System.currentTimeMillis())
+            targetTick = fresh
+            return fresh
+        }
     }
 
     // ---- target velocity: game field first, finite difference as fallback ----
@@ -1376,9 +1492,12 @@ internal object MemoryPatcher {
     }
 
     /** Finite angle only when a target exists; NaN means "use the native joystick angle". */
-    private fun aimAngle(pid: Int, base: Long): Float {
+    private fun aimAngle(pid: Int, base: Long, targets: List<EspTarget>): Float {
         // Skip the whole write path while the scene/controller is being replaced.
+        // Invalidate the published prediction so Triggerbot cannot fire against a
+        // target sampled before the scene swap.
         val lc = writableLocalController(pid, base) ?: run {
+            aimPredict = PredictSnapshot()
             logPredict("AIM", "paused - scene settling or invalid controller")
             return Float.NaN
         }
@@ -1389,7 +1508,7 @@ internal object MemoryPatcher {
         var best = 4000.0
         var found = Float.NaN
         var snap = PredictSnapshot(weapon = weaponNameOf(pid, activeWeapon(pid, lc)))
-        for (t in collectTargets(pid, base)) {
+        for (t in targets) {
             if (t.friendly) continue
             val dx = t.x - origin.first
             val dy = t.y - origin.second
@@ -1450,7 +1569,7 @@ internal object MemoryPatcher {
         if (losActive) hexToBytes(LOS_BRANCH_HEX) else hexToBytes(ANGLE_PATCH_HEX)
 
     /** Registers a finite-angle source. NaN from a provider means "abstain". */
-    fun registerAngleProvider(id: String, priority: Int, provider: () -> Float): Boolean {
+    fun registerAngleProvider(id: String, priority: Int, provider: (TargetTick) -> Float): Boolean {
         synchronized(angleLock) {
             val wasEmpty = angleProviders.isEmpty()
             val wasBranch = angleBranchInstalled
@@ -1542,28 +1661,45 @@ internal object MemoryPatcher {
         if (!angleHookInstalled) return
         val pid = findPid() ?: return
         val base = findModuleBase(pid) ?: return
+        // Collect once per tick, outside the registry lock. Every provider sees the
+        // same immutable snapshot; no /proc reads or target scans happen under the lock.
+        val targets = targetsFor(pid, base)
+        val providers = synchronized(angleLock) { angleProviders.values.toList() }
         var winner: AngleProvider? = null
         var angle = Float.NaN
-        synchronized(angleLock) {
-            for (p in angleProviders.values) {
-                val a = try {
-                    p.provider()
-                } catch (_: Throwable) {
-                    Float.NaN
-                }
-                val current = winner
-                if (a.isFinite() && (current == null || p.priority > current.priority)) {
-                    winner = p
-                    angle = a
-                }
+        for (p in providers) {
+            val a = try {
+                p.provider(targets)
+            } catch (_: Throwable) {
+                Float.NaN
+            }
+            val current = winner
+            if (a.isFinite() && (current == null || p.priority > current.priority)) {
+                winner = p
+                angle = a
             }
         }
-        writeFloat(pid, base + FIRE_ANGLE_OFFSET + FIRE_ANGLE_LITERAL, angle)
-        angleResolvedDeg = angle
-        angleResolvedBy = winner?.id ?: "-"
+        // The lock is held only for the final literal write and bookkeeping.
+        synchronized(angleLock) {
+            if (!angleHookInstalled) return
+            // Resolution ran outside the lock on an immutable snapshot. A provider
+            // can be unregistered between that snapshot and this write; publishing
+            // its now-stale angle would leak a disabled feature for one tick. Only
+            // the winner reaches the literal, so re-check its identity here and
+            // abstain (NaN) if it is gone.
+            val w = winner
+            if (w != null && angleProviders[w.id] !== w) {
+                winner = null
+                angle = Float.NaN
+            }
+            writeFloat(pid, base + FIRE_ANGLE_OFFSET + FIRE_ANGLE_LITERAL, angle)
+            angleResolvedDeg = angle
+            angleResolvedBy = winner?.id ?: "-"
+        }
         aimFlip = aimFlip.copy(writtenDeg = angle)
         // The cave returns native [Joypad+0x180] when its segment query fails. That can
         // point anywhere, including opposite the target, so surface that condition.
+        // The gate itself lives in the cave and is never relaxed here.
         if (losActive && losVisible(pid, base) == false &&
             (winner?.id == ANGLE_PROVIDER_AIMLOCK || winner?.id == ANGLE_PROVIDER_AUTOMELEE)
         ) {
@@ -1581,15 +1717,27 @@ internal object MemoryPatcher {
 
     fun toggleAimlock(enable: Boolean): Boolean {
         if (enable) {
-            val ok = registerAngleProvider(ANGLE_PROVIDER_AIMLOCK, ANGLE_PRIORITY_AIMLOCK) {
+            val ok = registerAngleProvider(ANGLE_PROVIDER_AIMLOCK, ANGLE_PRIORITY_AIMLOCK) { tick ->
                 val p = findPid()
                 val b = p?.let { findModuleBase(it) }
-                if (p == null || b == null) Float.NaN else aimAngle(p, b)
+                if (p == null || b == null) Float.NaN else aimAngle(p, b, tick.targets)
             }
             if (ok) PatchLogger.log("AIM", "direct aimlock enabled")
             return ok
         }
         unregisterAngleProvider(ANGLE_PROVIDER_AIMLOCK)
+        // Reinstate the old lifetime rule: once Aimlock releases the getter, the LOS
+        // branch must not persist while idle. Teardown is skipped when another angle
+        // provider or Triggerbot still needs the cave. This never toggles another
+        // feature and never requires one to be enabled - it only checks ownership.
+        val otherConsumer = synchronized(angleLock) {
+            angleProviders.keys.any { it != ANGLE_PROVIDER_AIMLOCK && it != ANGLE_PROVIDER_LOS }
+        } || triggerRunning
+        if (losActive && !otherConsumer) {
+            val p = findPid()
+            val b = p?.let { findModuleBase(it) }
+            if (p != null && b != null) uninstallLos(p, b)
+        }
         PatchLogger.log("AIM", "aimlock disabled")
         return true
     }
@@ -1673,16 +1821,14 @@ internal object MemoryPatcher {
     // ---- line of sight ---------------------------------------------------
 
     /** LOS supplies its own angle for the nearest visible hostile; NaN abstains. */
-    private fun losAngle(): Float {
+    private fun losAngle(pid: Int, base: Long, targets: List<EspTarget>): Float {
         if (!losActive) return Float.NaN
-        val pid = findPid() ?: return Float.NaN
-        val base = findModuleBase(pid) ?: return Float.NaN
         val lc = writableLocalController(pid, base) ?: return Float.NaN
         val origin = soldierPosition(pid, lc) ?: return Float.NaN
         losOrigin = origin
         var best = 4000.0
         var found = Float.NaN
-        for (t in collectTargets(pid, base)) {
+        for (t in targets) {
             if (t.friendly) continue
             val dx = t.x - origin.first
             val dy = t.y - origin.second
@@ -1724,9 +1870,15 @@ internal object MemoryPatcher {
         repeat(4) { data.putLong(0) }        // 32-byte zeroed query info
         if (!writeBytes(pid, base + LOS_DATA_OFFSET, data.array())) return false
         if (!writeBytes(pid, base + LOS_CODE_OFFSET, engine)) return false
+        resetLosGate()
         losActive = true
-        if (!registerAngleProvider(ANGLE_PROVIDER_LOS, ANGLE_PRIORITY_LOS) { losAngle() }) {
+        if (!registerAngleProvider(ANGLE_PROVIDER_LOS, ANGLE_PRIORITY_LOS) { tick ->
+                val p = findPid()
+                val b = p?.let { findModuleBase(it) }
+                if (p == null || b == null) Float.NaN else losAngle(p, b, tick.targets)
+            }) {
             losActive = false
+            resetLosGate()
             runCatching {
                 writeBytes(pid, base + LOS_CODE_OFFSET, ByteArray(engine.size))
                 writeBytes(pid, base + LOS_DATA_OFFSET, ByteArray(0xa0))
@@ -1761,6 +1913,7 @@ internal object MemoryPatcher {
         // Drop the branch before clearing the cave: the registry decides whether the
         // getter returns to the plain hook (other providers alive) or the game bytes.
         losActive = false
+        resetLosGate()
         unregisterAngleProvider(ANGLE_PROVIDER_LOS)
         runCatching {
             writeBytes(pid, base + LOS_CODE_OFFSET, ByteArray(hexToBytes(LOS_ENGINE_HEX).size))
@@ -1769,10 +1922,31 @@ internal object MemoryPatcher {
         PatchLogger.log("LOS", "uninstalled")
     }
 
+    /**
+     * Hysteresis over the cave's visibility flag. A single failed query must not
+     * flip the getter's consumer view back to native every tick. Unreadable slots
+     * still return null (the caller treats that as unreadable, never as visible),
+     * and a confirmed false keeps the native-angle fallback in force.
+     */
     fun losVisible(pid: Int, base: Long): Boolean? {
         if (!losActive) return null
         val v = readInt(pid, base + LOS_DATA_OFFSET + 4) ?: return null
-        return v == 1
+        val raw = v == 1
+        synchronized(losGateLock) {
+            val now = System.currentTimeMillis()
+            if (now - losGateSampleAtMs < LOS_SAMPLE_WINDOW_MS) return losVisibleStable
+            losGateSampleAtMs = now
+            if (losVisiblePending != raw) {
+                losVisiblePending = raw
+                losVisibleRun = 1
+            } else {
+                losVisibleRun++
+            }
+            if (losVisibleStable == null || losVisibleRun >= LOS_VISIBLE_STABLE_SAMPLES) {
+                losVisibleStable = raw
+            }
+            return losVisibleStable
+        }
     }
 
     // ---- triggerbot ------------------------------------------------------
@@ -1928,6 +2102,9 @@ internal object MemoryPatcher {
                         }
                         if (cp != p || cb != b) {
                             releaseFire(p, b, joy)
+                            // A detected restart must not be served the cached attach.
+                            invalidateProcCache()
+                            invalidateTargetTick()
                             p = cp; b = cb
                             joy = joypadPointer(cp, cb) ?: 0L
                             savedFireState = if (joy != 0L) readBytes(cp, joy + JOY_FIRE_STATE, 1)?.get(0) else null
@@ -1981,7 +2158,7 @@ internal object MemoryPatcher {
                                     Math.toRadians(a.toDouble()) else a.toDouble()
                                 val dx = kotlin.math.cos(rad)
                                 val dy = -kotlin.math.sin(rad)
-                                val candidates = collectTargets(cp, cb, withVelocity = true)
+                                val candidates = targetsFor(cp, cb).targets
                                     .filter {
                                         it.kind == KIND_DRONE || it.kind == KIND_HAWK ||
                                             it.kind == KIND_WORM || it.kind == KIND_PLAYER
@@ -2474,7 +2651,7 @@ internal object MemoryPatcher {
                     var snap = "g=${"%.2f".format(gravity)}[$gravitySrc] nade=$count $stats"
 
                     if (origin != null && sceneStable(p, b)) {
-                        val enemies = collectTargets(p, b, withVelocity = true)
+                        val enemies = targetsFor(p, b).targets
                             .filter { it.kind == KIND_PLAYER && !it.friendly }
                         // Grenade Aim selects and solves its own target; it does not
                         // borrow the LOS cave's target or visibility decision.
@@ -2565,6 +2742,10 @@ internal object MemoryPatcher {
     @Volatile private var autoMeleeAngle = Float.NaN
     @Volatile private var autoMeleeRunning = false
     private var autoMeleeThread: Thread? = null
+    // +0x208 is the game's swing timer: updateStep adds dt and endMeleeAttack clears
+    // it at ~0.35 s. Zeroing it every tick prevents the swing from ever completing.
+    @Volatile private var meleeHadTarget = false
+    @Volatile private var meleeArmed = false
 
     /** Primary weapon only; MACHETE has a fixed 40-unit reach, no dual-wield modifier. */
     private fun autoMeleeReachOf(pid: Int, lc: Long): Double {
@@ -2580,12 +2761,16 @@ internal object MemoryPatcher {
         val base = pid?.let { findModuleBase(it) }
         if (pid == null || base == null) {
             autoMeleeAngle = Float.NaN
+            meleeHadTarget = false
+            meleeArmed = false
             autoMeleeState = "detached"
             return
         }
         val lc = writableLocalController(pid, base)
         if (lc == null) {
             autoMeleeAngle = Float.NaN
+            meleeHadTarget = false
+            meleeArmed = false
             autoMeleeState = "scene"
             return
         }
@@ -2596,12 +2781,14 @@ internal object MemoryPatcher {
         val pos = body?.let { bodyPosition(pid, it) }
         if (body == null || origin == null || pos == null) {
             autoMeleeAngle = Float.NaN
+            meleeHadTarget = false
+            meleeArmed = false
             autoMeleeState = "body"
             return
         }
         var best = Double.NaN
         var deg = Float.NaN
-        for (t in collectTargets(pid, base)) {
+        for (t in targetsFor(pid, base).targets) {
             if (t.friendly) continue
             val dx = t.x - origin.first
             val dy = t.y - origin.second
@@ -2613,18 +2800,29 @@ internal object MemoryPatcher {
         autoMeleeNearest = best
         if (deg.isNaN()) {
             autoMeleeAngle = Float.NaN
+            meleeHadTarget = false
+            meleeArmed = false
             autoMeleeState = "no target reach=${"%.1f".format(reach)}"
             return
         }
-        // endMeleeAttack clears the flag after each swing, so assert it every tick.
+        // Flag and body doubles are asserted every tick. The swing timer is different:
+        // updateStep increments +0x208 by dt and endMeleeAttack zeroes it at ~0.35 s,
+        // so reset it only on an arm edge. A new target or a game-cleared flag is that edge.
+        val flagNow = readBytes(pid, lc + LC_MELEE_FLAG, 1)?.get(0)?.toInt() ?: 0
+        val swingActive = flagNow and 1
+        val armEdge = !meleeArmed || !meleeHadTarget || swingActive == 0
         val ok = writeBytes(pid, lc + LC_MELEE_FLAG, byteArrayOf(1)) and
             writeDouble(pid, lc + LC_MELEE_POS_X, pos.first) and
             writeDouble(pid, lc + LC_MELEE_POS_Y, pos.second) and
-            writeFloat(pid, lc + LC_MELEE_ANGLE, 0f)
+            (!armEdge || writeFloat(pid, lc + LC_MELEE_ANGLE, 0f))
+        meleeHadTarget = true
+        meleeArmed = true
         autoMeleeAngle = deg
-        autoMeleeState = if (ok) "armed" else "write-failed"
+        autoMeleeState = if (ok) (if (armEdge) "armed" else "swinging") else "write-failed"
+        val timer = readFloat(pid, lc + LC_MELEE_ANGLE) ?: Float.NaN
         logPredict("MELEE",
-            "reach=${"%.1f".format(reach)} d=${"%.1f".format(best)} deg=${"%.1f".format(deg)} $autoMeleeState")
+            "reach=${"%.1f".format(reach)} d=${"%.1f".format(best)} deg=${"%.1f".format(deg)} " +
+                "arm=$armEdge swing=$swingActive timer=${"%.3f".format(timer)} $autoMeleeState")
     }
 
     /** Fully self-contained: its own provider, its own thread, no other feature's state. */
@@ -2664,8 +2862,12 @@ internal object MemoryPatcher {
             // Ignore.
         }
         autoMeleeThread = null
-        autoMeleeAngle = Float.NaN
+        // Do not publish NaN on teardown: the provider is removed from the registry
+        // first, so remaining finite providers resolve the next tick. Injecting NaN
+        // here would make the ticker propagate a native-angle flip for one tick.
         unregisterAngleProvider(ANGLE_PROVIDER_AUTOMELEE)
+        meleeHadTarget = false
+        meleeArmed = false
         val pid = findPid()
         val base = pid?.let { findModuleBase(it) }
         if (pid != null && base != null) {
@@ -3065,12 +3267,14 @@ internal object MemoryPatcher {
                     if (tick++ % 4 == 0) {
                         val nowPid = findPid()
                         if (nowPid == null || nowPid != joinPid) {
+                            invalidateProcCache()
                             joinEmit("PIDCHG now=$nowPid expected=$joinPid")
                             stopJoinCaptureInternal("pid change")
                             break
                         }
                         val nowBase = findModuleBase(nowPid)
                         if (nowBase == null || nowBase != joinBase) {
+                            invalidateProcCache()
                             joinEmit("BASECHG now=${jhex(nowBase)} expected=${jhex(joinBase)}")
                             stopJoinCaptureInternal("module base change")
                             break
