@@ -34,6 +34,19 @@ jobs:
           channel: 'stable'
           cache: true
 
+      - name: Add Gradle plugin repository fallback
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/plugin-repos.gradle" <<'EOF'
+          beforeSettings { settings ->
+              settings.pluginManagement.repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
       - name: Install dependencies
         run: flutter pub get
 
