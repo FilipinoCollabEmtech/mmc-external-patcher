@@ -2734,9 +2734,17 @@ internal object MemoryPatcher {
     private const val LC_MELEE_POS_Y = 0x200L
     private const val LC_MELEE_ANGLE = 0x208L
 
+    const val AUTO_MELEE_REACH_MIN = 20
+    const val AUTO_MELEE_REACH_MAX = 120
+    // Tuning start point: MACHETE raw 40 + ~10 of enemy-radius slack; not game-verified.
+    const val AUTO_MELEE_REACH_DEFAULT = 50
+
     @Volatile var autoMeleeEnabled = false
         private set
-    @Volatile private var autoMeleeReach = 20.0
+    @Volatile var autoMeleeReachSetting: Int = AUTO_MELEE_REACH_DEFAULT
+        private set
+    @Volatile private var autoMeleeReachRaw = 20.0
+    @Volatile private var autoMeleeReach = AUTO_MELEE_REACH_DEFAULT.toDouble()
     @Volatile private var autoMeleeNearest = Double.NaN
     @Volatile private var autoMeleeState = "off"
     @Volatile private var autoMeleeAngle = Float.NaN
@@ -2747,12 +2755,21 @@ internal object MemoryPatcher {
     @Volatile private var meleeHadTarget = false
     @Volatile private var meleeArmed = false
 
-    /** Primary weapon only; MACHETE has a fixed 40-unit reach, no dual-wield modifier. */
-    private fun autoMeleeReachOf(pid: Int, lc: Long): Double {
+    /** Game-derived collision length kept only for comparison against the setting. */
+    private fun gameMeleeReachOf(pid: Int, lc: Long): Double {
         val w = readLong(pid, lc + LC_PRIMARY) ?: return 20.0
         if (w == 0L) return 20.0
         if (readInt(pid, w + W_TYPE) == 1) return 40.0
         return (readInt(pid, w + W_MELEE_LEN)?.toDouble() ?: 20.0).coerceIn(1.0, 200.0)
+    }
+
+    /** User-tuned collision radius; temporary until replaced by a constant. */
+    private fun autoMeleeReachOf(): Double = autoMeleeReachSetting.toDouble()
+
+    fun setAutoMeleeReach(v: Int) {
+        val next = v.coerceIn(AUTO_MELEE_REACH_MIN, AUTO_MELEE_REACH_MAX)
+        autoMeleeReachSetting = next
+        PatchLogger.log("MELEE", "set reach=$next raw=${"%.1f".format(autoMeleeReachRaw)}")
     }
 
     /** Nearest hostile inside reach; hit fields are re-armed every tick while in reach. */
@@ -2774,8 +2791,10 @@ internal object MemoryPatcher {
             autoMeleeState = "scene"
             return
         }
-        val reach = autoMeleeReachOf(pid, lc)
+        val reach = autoMeleeReachOf()
+        val raw = gameMeleeReachOf(pid, lc)
         autoMeleeReach = reach
+        autoMeleeReachRaw = raw
         val body = readLong(pid, lc + 0x1a8)?.takeIf { it != 0L }
         val origin = soldierPosition(pid, lc)
         val pos = body?.let { bodyPosition(pid, it) }
@@ -2821,7 +2840,8 @@ internal object MemoryPatcher {
         autoMeleeState = if (ok) (if (armEdge) "armed" else "swinging") else "write-failed"
         val timer = readFloat(pid, lc + LC_MELEE_ANGLE) ?: Float.NaN
         logPredict("MELEE",
-            "reach=${"%.1f".format(reach)} d=${"%.1f".format(best)} deg=${"%.1f".format(deg)} " +
+            "setting=${"%.1f".format(reach)} raw=${"%.1f".format(raw)} " +
+                "d=${"%.1f".format(best)} deg=${"%.1f".format(deg)} " +
                 "arm=$armEdge swing=$swingActive timer=${"%.3f".format(timer)} $autoMeleeState")
     }
 
@@ -3061,7 +3081,7 @@ internal object MemoryPatcher {
         sb.appendLine("GREN CAVE: $grenadeDiag")
         sb.appendLine("GREN COUNT: before=$grenadeCountBefore after=$grenadeCountAfter " +
             "requested=$grenadeThrowRequested reason=$grenadeFailReason")
-        sb.appendLine("AUTOMELEE: enabled=$autoMeleeEnabled reach=${f1(autoMeleeReach)} " +
+        sb.appendLine("AUTOMELEE: enabled=$autoMeleeEnabled setting=$autoMeleeReachSetting reach=${f1(autoMeleeReach)} raw=${f1(autoMeleeReachRaw)} " +
             "nearest=${f1(autoMeleeNearest)} state=$autoMeleeState " +
             "angle=${f1(autoMeleeAngle.toDouble())} resolvedBy=$angleResolvedBy " +
             "written=${f1(angleResolvedDeg.toDouble())}")

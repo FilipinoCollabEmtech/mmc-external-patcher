@@ -61,6 +61,8 @@ internal class FloatingMenu(private val activity: MainActivity) {
     /** Slider values persist across panel rebuilds the same way toggles do. */
     private val sliderValues = LinkedHashMap<String, Float>().apply {
         put("pov", MemoryPatcher.povPercent.toFloat().coerceIn(MemoryPatcher.POV_MIN.toFloat(), MemoryPatcher.POV_MAX.toFloat()))
+        put("autoMeleeReach", MemoryPatcher.autoMeleeReachSetting.toFloat().coerceIn(
+            MemoryPatcher.AUTO_MELEE_REACH_MIN.toFloat(), MemoryPatcher.AUTO_MELEE_REACH_MAX.toFloat()))
     }
 
     private val accent = Color.rgb(255, 92, 92)
@@ -408,6 +410,12 @@ internal class FloatingMenu(private val activity: MainActivity) {
         container.addView(toggleRow("autoMelee", "⚔", "Auto Melee",
             "Lock and hit enemies within melee reach only") { checked ->
             MemoryPatcher.toggleAutoMelee(checked)
+        })
+        container.addView(sliderRow("autoMeleeReach", "↔", "Auto Melee Reach",
+            "Enemy collision distance - tune on device", MemoryPatcher.AUTO_MELEE_REACH_MIN,
+            MemoryPatcher.AUTO_MELEE_REACH_MAX, 1, "") { v ->
+            MemoryPatcher.setAutoMeleeReach(v)
+            true // in-memory only; applies immediately while MMC is running
         })
         container.addView(toggleRow("autoGrenade", "✹", "Grenade Aim",
             "Ballistic aim on crouched enemies · tap HUD grenade to throw") { checked ->
